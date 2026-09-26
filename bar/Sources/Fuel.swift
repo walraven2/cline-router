@@ -102,6 +102,11 @@ func fuelNum(_ value: Double) -> String {
     return f.string(from: NSNumber(value: value)) ?? String(format: "%.2f", value)
 }
 
+/// 取整的金额（带千分位，如 "1,046"）——给状态栏这种窄空间用，用户要求不显示小数
+func fuelInt(_ value: Double) -> String {
+    fuelIntFormatter.string(from: NSNumber(value: value.rounded())) ?? String(format: "%.0f", value)
+}
+
 final class FuelMonitor {
     static let shared = FuelMonitor()
 

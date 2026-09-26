@@ -56,12 +56,56 @@ if cliArgs.contains("--login-off") {
     exit(0)
 }
 
+// MARK: - 性能打点
+//
+// 只在超过阈值时往 bar.log 写一行，平时零开销。用来回答「点一下怎么有点慢」：
+// 若日志里出现 menuNeedsUpdate 的行，说明慢在菜单构建（菜单项变多 / 依赖变慢）；
+// 若出现 action.* 的行，说明慢在那个动作本身（如打开浏览器、launchctl 调用）。
+private let perfThresholdMS: Double = 20
+private let perfFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss.SSS"
+    return f
+}()
+
+func perfLog(_ label: String, _ ms: Double) {
+    guard ms >= perfThresholdMS else { return }
+    let line = "[\(perfFormatter.string(from: Date()))] PERF \(label) \(String(format: "%.0f", ms))ms\n"
+    guard let h = openAppendHandle(barLogPath), let data = line.data(using: .utf8) else { return }
+    h.write(data)
+    try? h.close()
+}
+
+func measure<T>(_ label: String, _ body: () -> T) -> T {
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let result = body()
+    perfLog(label, (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+    return result
+}
+
 // MARK: - 菜单栏应用
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let service = RouterService()
     let menu = NSMenu()
     var statusItem: NSStatusItem!
+
+    // 固定菜单项：启动时构建一次，之后只更新「文本 / 可用性 / 子菜单内容」，绝不重建结构。
+    // 旧实现每次打开菜单都 removeAllItems + 重建上百个菜单项，菜单项越多弹出越慢，且纯属浪费。
+    private var headItem: NSMenuItem!
+    private var fuelItem: NSMenuItem!
+    private let fuelMenu = NSMenu()
+    private var creditsItem: NSMenuItem!
+    private let creditsMenu = NSMenu()
+    private var copyItem: NSMenuItem!
+    private var defItem: NSMenuItem!
+    private let defMenu = NSMenu()
+    private var logItem: NSMenuItem!
+    private let logMenu = NSMenu()
+    private var restartItem: NSMenuItem!
+    private var startItem: NSMenuItem!
+    private var stopItem: NSMenuItem!
+    private var loginItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 防重复实例：用文件锁（flock）而不是 NSRunningApplication 计数 ——
@@ -84,26 +128,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
 
+        buildFixedMenu()        // 菜单结构只建这一次，之后永不重建
+        refreshMenuData()       // 填第一版数据
+
         service.refresh { [weak self] in
             guard let self = self else { return }
-            self.updateTitle()
+            self.refreshMenuData()
             // 打开 App 时若路由没在跑：先给 launchd 的 router agent 几秒（开机时它也在启动），
             // 等几轮仍没有才自己拉起 —— 直接抢着拉会与 agent 形成双实例竞争（会互相拖死）。
             if !self.service.running {
                 self.refreshSoon(6.0, retries: 3, autoStartIfDown: true)
             }
         }
-        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.service.refresh { self?.updateTitle() }
+
+        // 统一刷新节奏：60 秒一轮（服务状态 + 燃料 + 积分共用，不再各开一个定时器）
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.tick()
         }
 
-        // 火山方舟燃料余额：独立节奏（30s）读本机路由 /api/fuel，不拖慢路由状态轮询
-        FuelMonitor.shared.onUpdate = { [weak self] in self?.updateTitle() }
-        FuelMonitor.shared.start(interval: 30)
+        // 火山方舟燃料余额：每 60s 读本机路由 /api/fuel（路由内部自己去拉上游，约 300s 一轮）
+        FuelMonitor.shared.onUpdate = { [weak self] in self?.refreshMenuData() }
+        FuelMonitor.shared.start(interval: 60)
 
-        // WorkBuddy / CodeBuddy 积分：同样 30s 读本机路由 /api/workbuddy
-        WorkbuddyMonitor.shared.onUpdate = { [weak self] in self?.updateTitle() }
-        WorkbuddyMonitor.shared.start(interval: 30)
+        // WorkBuddy / CodeBuddy 积分：同样每 60s 读本机路由 /api/workbuddy
+        WorkbuddyMonitor.shared.onUpdate = { [weak self] in self?.refreshMenuData() }
+        WorkbuddyMonitor.shared.start(interval: 60)
+    }
+
+    /// 一轮定时刷新：探一次服务状态 → 刷新状态栏标题与菜单里的动态数据
+    func tick() {
+        service.refresh { [weak self] in
+            guard let self = self else { return }
+            self.refreshMenuData()
+        }
+    }
+
+    /// 菜单即将展开：只刷状态文本与可用性（<5ms，零重建），菜单瞬时弹出。
+    /// 子菜单内容（燃料/积分/默认模型/最近请求）由 60s 定时器与数据回调负责，最多滞后一分钟。
+    func menuWillOpen(_ menu: NSMenu) {
+        measure("menuWillOpen(刷状态文本)") { refreshStatus() }
     }
 
     // 在访达里双击已在运行的 App 时，直接打开配置面板
@@ -112,30 +175,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
+    /// 状态栏标题：按用户要求保持极简，只有「火山月度占比｜WorkBuddy 余额」——
+    /// 形如 `8.9%｜1,045.73`，不带任何图标/emoji/单位说明（跟系统菜单栏图标保持同一种克制风格）。
+    /// 某一项暂时没有数据时该位置显示 `—`；完整信息（端口/默认模型/模型数/重置时间）放 tooltip。
     func updateTitle() {
         let cfg = RouterConfig.load()
-        let fuel = fuelInline()
+        let fuel = fuelMonthlyInline()
         let credits = creditsInline()
+        statusItem.button?.title = "\(fuel.isEmpty ? "—" : fuel)｜\(credits.isEmpty ? "—" : credits)"
+
         if service.running {
-            statusItem.button?.title = "⇄ \(cfg.modelIds.count)" + (fuel.isEmpty ? "" : " · ⛽\(fuel)")
-            statusItem.button?.toolTip = "Cline 路由：运行中 · 端口 \(cfg.port) · 默认 \(cfg.defaultModel.isEmpty ? "未设置" : cfg.defaultModel) · \(cfg.modelIds.count) 个模型"
-                + (fuel.isEmpty ? "" : "\n火山燃料：最紧窗口已用 \(fuel)")
-                + (credits.isEmpty ? "" : "\nWorkBuddy 积分：\(credits)")
+            var tip = "Cline 路由：运行中 · 端口 \(cfg.port) · 默认 \(cfg.defaultModel.isEmpty ? "未设置" : cfg.defaultModel) · \(cfg.modelIds.count) 个模型"
+            if let m = fuelMonthlyWindow() {
+                tip += "\n火山月度：\(m.detail)" + (m.resetAt.isEmpty ? "" : " · \(m.resetAt) 重置")
+            } else if !fuel.isEmpty {
+                tip += "\n火山燃料（最紧窗口）：已用 \(fuel)"
+            }
+            let creditsBrief = creditsBriefInline()
+            if !creditsBrief.isEmpty { tip += "\nWorkBuddy 积分：\(creditsBrief)" }
+            statusItem.button?.toolTip = tip
         } else {
-            statusItem.button?.title = "⇄ ⏸"
             statusItem.button?.toolTip = "Cline 路由：未运行（点此启动）"
         }
     }
 
-    /// 状态栏内嵌的燃料指示：取已用比例最高的窗口（如 "5.0%"）
-    private func fuelInline() -> String {
+    /// 火山「月度」窗口（状态栏按用户偏好只看月度）
+    private func fuelMonthlyWindow() -> FuelWindow? {
+        guard service.running, let snap = FuelMonitor.shared.snapshot, snap.ok else { return nil }
+        return snap.windows.first { $0.key == "monthly" }
+    }
+
+    /// 状态栏里的火山指示：月度已用占比（如 "8.9%"）；没有月度窗口数据时退回「最紧窗口」
+    private func fuelMonthlyInline() -> String {
+        if let m = fuelMonthlyWindow() { return m.brief }
         guard service.running, let snap = FuelMonitor.shared.snapshot, snap.ok,
               let tight = snap.tightest else { return "" }
         return tight.brief
     }
 
-    /// tooltip 里的积分摘要（如 "1,186.58 / 16,642（7.1%）"）
+    /// 状态栏里的 WorkBuddy 数值：余额取整（如 "1,046"）——用户要求不显示小数
     private func creditsInline() -> String {
+        guard service.running, let snap = WorkbuddyMonitor.shared.snapshot, snap.ok else { return "" }
+        return fuelInt(snap.totalRemain)
+    }
+
+    /// tooltip 里的完整积分摘要（如 "1,045.73 / 16,642（6.3%）"）
+    private func creditsBriefInline() -> String {
         guard service.running, let snap = WorkbuddyMonitor.shared.snapshot, snap.ok else { return "" }
         return snap.brief
     }
@@ -150,8 +235,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "⛽ 火山燃料 " + parts.joined(separator: " · ")
     }
 
-    private func buildFuelMenu() -> NSMenu {
-        let sub = NSMenu()
+    /// 重填燃料子菜单内容（复用同一个 NSMenu 对象：菜单结构固定，只换内容）
+    private func fillFuelMenu() {
+        let sub = fuelMenu
+        sub.removeAllItems()
         sub.autoenablesItems = false
         let snap = FuelMonitor.shared.snapshot
         func disabled(_ title: String) {
@@ -185,7 +272,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let cred = NSMenuItem(title: "打开凭据文件（volc-fuel.json）", action: #selector(openFuelCred), keyEquivalent: "")
         cred.target = self
         sub.addItem(cred)
-        return sub
     }
 
     @objc func refreshFuel() {
@@ -215,8 +301,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return title
     }
 
-    private func buildCreditsMenu() -> NSMenu {
-        let sub = NSMenu()
+    /// 重填积分子菜单内容（复用同一个 NSMenu 对象）
+    private func fillCreditsMenu() {
+        let sub = creditsMenu
+        sub.removeAllItems()
         sub.autoenablesItems = false
         let snap = WorkbuddyMonitor.shared.snapshot
         func disabled(_ title: String) {
@@ -269,17 +357,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let openState = NSMenuItem(title: "打开 WorkBuddy 状态文件夹", action: #selector(openWorkbuddyState), keyEquivalent: "")
         openState.target = self
         sub.addItem(openState)
-        return sub
     }
 
     @objc func refreshCredits() {
-        WorkbuddyMonitor.shared.refresh { [weak self] in self?.updateTitle() }
+        WorkbuddyMonitor.shared.refresh { [weak self] in self?.refreshMenuData() }
     }
 
     @objc func checkinCredits() {
         WorkbuddyMonitor.shared.checkin { [weak self] _ in
             NSSound.beep()
-            self?.updateTitle()
+            self?.refreshMenuData()
         }
     }
 
@@ -296,6 +383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self = self else { return }
             self.service.refresh {
+                self.refreshStatus()
                 self.updateTitle()
                 if self.service.running { return }
                 if retries > 0 {
@@ -308,36 +396,132 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 等服务就绪：重启/启动后 onefile 要自解压 15~20 秒才监听端口。
+    /// 期间每 1.5 秒刷一次状态与标题，一亮就把图标切回「● 运行中」——用户不必自己再点一次。
+    func waitForRunning(tries: Int = 24, interval: Double = 1.5) {
+        func tick(_ left: Int) {
+            guard left > 0 else { return }
+            service.refresh { [weak self] in
+                guard let self = self else { return }
+                self.refreshStatus()
+                self.updateTitle()
+                if self.service.running { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + interval) { tick(left - 1) }
+            }
+        }
+        tick(tries)
+    }
+
+    /// 等停止完成（bootout + 进程退出一般 <1 秒），最多等 ~6 秒。
+    func waitForStopped(tries: Int = 6, interval: Double = 1.0) {
+        func tick(_ left: Int) {
+            guard left > 0 else { return }
+            service.refresh { [weak self] in
+                guard let self = self else { return }
+                self.refreshStatus()
+                self.updateTitle()
+                if !self.service.running { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + interval) { tick(left - 1) }
+            }
+        }
+        tick(tries)
+    }
+
     // MARK: 菜单构建
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
-        let cfg = RouterConfig.load()
-
-        let head = NSMenuItem(title: service.running
-                              ? "● 运行中 · 端口 \(cfg.port) · \(cfg.modelIds.count) 个模型"
-                              : "○ 未运行 · 端口 \(cfg.port)",
-                              action: nil, keyEquivalent: "")
-        head.isEnabled = false
-        menu.addItem(head)
+    /// 构建固定菜单：所有菜单项对象只在这里创建一次，之后只由 refreshMenuData() 改文本/可用性。
+    private func buildFixedMenu() {
+        headItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        headItem.isEnabled = false
+        menu.addItem(headItem)
         menu.addItem(.separator())
 
-        let fuelItem = NSMenuItem(title: fuelMenuTitle(), action: nil, keyEquivalent: "")
-        fuelItem.submenu = buildFuelMenu()
+        fuelItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        fuelMenu.autoenablesItems = false
+        fuelItem.submenu = fuelMenu
         menu.addItem(fuelItem)
 
-        let creditsItem = NSMenuItem(title: creditsMenuTitle(), action: nil, keyEquivalent: "")
-        creditsItem.submenu = buildCreditsMenu()
+        creditsItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        creditsMenu.autoenablesItems = false
+        creditsItem.submenu = creditsMenu
         menu.addItem(creditsItem)
 
         add(menu, "打开配置面板…", #selector(openPanel), "o")
-        add(menu, "复制 API 地址（http://127.0.0.1:\(cfg.port)/v1）", #selector(copyAPI), "")
+
+        copyItem = NSMenuItem(title: "", action: #selector(copyAPI), keyEquivalent: "")
+        copyItem.target = self
+        menu.addItem(copyItem)
 
         // 默认模型子菜单：Cline 里固定填 auto，实际走这里的选中项
-        let defItem = NSMenuItem(title: "默认模型（当前：\(cfg.defaultModel.isEmpty ? "未设置" : cfg.defaultModel)）",
-                                 action: nil, keyEquivalent: "")
-        let defMenu = NSMenu()
+        defItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         defMenu.autoenablesItems = false
+        defItem.submenu = defMenu
+        menu.addItem(defItem)
+
+        // 最近请求子菜单
+        logItem = NSMenuItem(title: "最近请求", action: nil, keyEquivalent: "")
+        logMenu.autoenablesItems = false
+        logItem.submenu = logMenu
+        menu.addItem(logItem)
+
+        menu.addItem(.separator())
+
+        restartItem = add(menu, "重启路由服务", #selector(restartService), "r")
+        startItem = add(menu, "启动路由服务", #selector(startService), "")
+        stopItem = add(menu, "停止路由服务", #selector(stopService), "")
+
+        menu.addItem(.separator())
+
+        add(menu, "打开配置文件夹", #selector(openFolder), "")
+        loginItem = NSMenuItem(title: "开机自启（路由服务 + 菜单栏图标）",
+                               action: #selector(toggleLoginItem), keyEquivalent: "")
+        loginItem.target = self
+        menu.addItem(loginItem)
+
+        menu.addItem(.separator())
+        add(menu, "退出", #selector(quitApp), "q")
+    }
+
+    @discardableResult
+    private func add(_ menu: NSMenu, _ title: String, _ action: Selector, _ key: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        menu.addItem(item)
+        return item
+    }
+
+    // MARK: 菜单数据刷新（只改内容，不动结构）
+
+    /// 全量刷新：状态行 / 燃料 / 积分 / 默认模型 / 最近请求 / 按钮可用性 / 状态栏标题。
+    /// 纯文本与少量子菜单重建，实测 1~3ms。
+    func refreshMenuData() {
+        refreshStatus()
+        fillDefaultMenu(RouterConfig.load())
+        fuelItem.title = fuelMenuTitle()
+        fillFuelMenu()
+        creditsItem.title = creditsMenuTitle()
+        fillCreditsMenu()
+        fillLogMenu()
+        updateTitle()
+    }
+
+    /// 只刷「状态相关」的文本与可用性 —— 不重建任何子菜单。
+    /// 用在：菜单展开前、服务启停的 1.5s 等待轮询、开机自启开关之后。
+    func refreshStatus() {
+        let cfg = RouterConfig.load()
+        headItem.title = service.running
+            ? "● 运行中 · 端口 \(cfg.port) · \(cfg.modelIds.count) 个模型"
+            : "○ 未运行 · 端口 \(cfg.port)"
+        copyItem.title = "复制 API 地址（http://127.0.0.1:\(cfg.port)/v1）"
+        defItem.title = "默认模型（当前：\(cfg.defaultModel.isEmpty ? "未设置" : cfg.defaultModel)）"
+        restartItem.isEnabled = true
+        startItem.isEnabled = !service.running
+        stopItem.isEnabled = service.running
+        loginItem.state = loginItemEnabled() ? .on : .off
+    }
+
+    private func fillDefaultMenu(_ cfg: RouterConfig) {
+        defMenu.removeAllItems()
         if !service.running {
             let off = NSMenuItem(title: "（服务未运行，无法切换）", action: nil, keyEquivalent: "")
             off.isEnabled = false
@@ -360,39 +544,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 defMenu.addItem(item)
             }
         }
-        defItem.submenu = defMenu
-        menu.addItem(defItem)
+    }
 
-        // 模型子菜单
-        let modelItem = NSMenuItem(title: "模型（\(cfg.modelDetails.count)）", action: nil, keyEquivalent: "")
-        let modelMenu = NSMenu()
-        modelMenu.autoenablesItems = false
-        let hint = NSMenuItem(title: "点击复制模型 ID", action: nil, keyEquivalent: "")
-        hint.isEnabled = false
-        modelMenu.addItem(hint)
-        modelMenu.addItem(.separator())
-        if cfg.modelDetails.isEmpty {
-            let empty = NSMenuItem(title: "（还没有配置模型）", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            modelMenu.addItem(empty)
-        }
-        for m in cfg.modelDetails {
-            let title = "\(m.id)  →  \(m.model)".count > 60
-                ? String("\(m.id)  →  \(m.model)".prefix(60)) + "…"
-                : "\(m.id)  →  \(m.model)"
-            let item = NSMenuItem(title: title, action: #selector(copyModelId(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = m.id
-            item.toolTip = "复制 \(m.id)"
-            modelMenu.addItem(item)
-        }
-        modelItem.submenu = modelMenu
-        menu.addItem(modelItem)
-
-        // 最近请求子菜单
-        let logItem = NSMenuItem(title: "最近请求", action: nil, keyEquivalent: "")
-        let logMenu = NSMenu()
-        logMenu.autoenablesItems = false
+    private func fillLogMenu() {
+        logMenu.removeAllItems()
         let recent = tailLog(8, onlyRequests: true)
         if recent.isEmpty {
             let empty = NSMenuItem(title: "（暂无请求记录）", action: nil, keyEquivalent: "")
@@ -409,55 +564,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let openLogItem = NSMenuItem(title: "打开完整日志", action: #selector(openLog), keyEquivalent: "")
         openLogItem.target = self
         logMenu.addItem(openLogItem)
-        logItem.submenu = logMenu
-        menu.addItem(logItem)
-
-        menu.addItem(.separator())
-
-        add(menu, "重启路由服务", #selector(restartService), "r")
-        if service.running {
-            add(menu, "停止路由服务", #selector(stopService), "")
-        } else {
-            add(menu, "启动路由服务", #selector(startService), "")
-        }
-
-        menu.addItem(.separator())
-
-        add(menu, "打开配置文件夹", #selector(openFolder), "")
-        let login = NSMenuItem(title: "开机自启（路由服务 + 菜单栏图标）",
-                               action: #selector(toggleLoginItem), keyEquivalent: "")
-        login.target = self
-        login.state = loginItemEnabled() ? .on : .off
-        menu.addItem(login)
-
-        menu.addItem(.separator())
-        add(menu, "退出", #selector(quitApp), "q")
-    }
-
-    private func add(_ menu: NSMenu, _ title: String, _ action: Selector, _ key: String) {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
-        item.target = self
-        menu.addItem(item)
     }
 
     // MARK: 动作
 
     @objc func openPanel() {
         let cfg = RouterConfig.load()
-        if let url = URL(string: "http://127.0.0.1:\(cfg.port)/ui") {
-            NSWorkspace.shared.open(url)
+        measure("action.openPanel(含拉起浏览器)") {
+            if let url = URL(string: "http://127.0.0.1:\(cfg.port)/ui") {
+                NSWorkspace.shared.open(url)
+            }
         }
     }
 
     @objc func copyAPI() {
         let cfg = RouterConfig.load()
         copyToClipboard("http://127.0.0.1:\(cfg.port)/v1")
-    }
-
-    @objc func copyModelId(_ sender: NSMenuItem) {
-        if let id = sender.representedObject as? String {
-            copyToClipboard(id)
-        }
     }
 
     @objc func setDefaultModel(_ sender: NSMenuItem) {
@@ -497,24 +619,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func restartService() {
-        service.restart()
-        refreshSoon()
+        measure("action.restartService(提交)") { service.restart() }
+        waitForRunning()
     }
 
     @objc func startService() {
-        service.start()
-        refreshSoon()
+        measure("action.startService(提交)") { service.start() }
+        waitForRunning()
     }
 
     @objc func stopService() {
-        service.stop()
-        refreshSoon(0.5)
+        measure("action.stopService(提交)") { service.stop() }
+        waitForStopped()
     }
 
     @objc func toggleLoginItem() {
         let nowEnabled = loginItemEnabled()
-        if !setLoginItem(!nowEnabled) {
-            NSSound.beep()
+        // setLoginItem 内部有 4~6 次 launchctl 同步调用（实测每次 20~45ms），整体放后台，
+        // 否则点这一下主线程会僵住近一秒。
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = setLoginItem(!nowEnabled)
+            DispatchQueue.main.async { [weak self] in
+                if !ok { NSSound.beep() }
+                self?.refreshStatus()
+                self?.updateTitle()
+            }
         }
     }
 
@@ -522,8 +651,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 关键：先卸载菜单栏 LaunchAgent 再退出。
         // plist 里 KeepAlive=1，不先 bootout 的话进程一退出就被 launchd 立刻拉回来（表现为"关不掉"）。
         // plist 文件保留，所以下次登录仍会按「开机自启」设置自动启动。
-        if agentLoaded(barLabel) { bootout(barLabel) }
-        NSApp.terminate(nil)
+        // bootout 是同步阻塞调用：放后台执行，退出会慢一两百毫秒但不再卡主线程。
+        DispatchQueue.global(qos: .userInitiated).async {
+            if agentLoaded(barLabel) { bootout(barLabel) }
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
     }
 }
 

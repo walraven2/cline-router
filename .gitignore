@@ -20,3 +20,7 @@ images/*
 
 # ---------- macOS ----------
 .DS_Store
+
+# ---------- 二进制备份（源码备份 *.swift/*.py 仍入库）----------
+bar/backups/ClineRouterBar.[0-9]*
+bar/backups/router.[0-9]*

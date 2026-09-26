@@ -179,7 +179,7 @@ bash ~/Cline 路由/make_template.sh   # 从 models.json 生成脱敏模板，�
 | GET | `/ui` | 无 | 配置面板（含绘图） |
 | GET | `/api/config` | 无 | 读配置（面板用） |
 | POST | `/api/config` | 需头 `X-Router-UI: 1` | 保存配置 + 热加载（防跨站） |
-| POST | `/api/default` | 需头 `X-Router-UI: 1` | 切换默认模型（`{"id":"volc-kimi-k3"}`），写盘 + 热加载 |
+| POST | `/api/default` | 需头 `X-Router-UI: 1` | 切换默认模型（`{"id":"volc-kimi-k3"}`），**以磁盘最新配置为基准**改写 + 写盘 + 热加载（见 §5.5） |
 | POST | `/api/test` | 需头 `X-Router-UI: 1` | 测试单个对话模型连通性 |
 | POST | `/api/image` | 需头 `X-Router-UI: 1` | 生成图片并把结果**下载落盘** |
 | GET | `/images/<文件>` | 无 | 查看已生成图片（仅 basename，防目录穿越） |
@@ -217,10 +217,21 @@ Cline 官方 API（`api.cline.bot`）的**非流式**响应是 `{"data": {...cho
 ### 5.5 配置热加载
 面板保存 → 写盘（备份+原子替换）→ `reload_config()` 重建 Config 对象并替换 `Router.config`。**失败时保留旧配置**，不退出进程。手工编辑 `models.json` 后必须 `restart`（服务启动时读一次）。
 
+**铁律：写配置一律以磁盘为准，绝不能用进程内存快照整份写回。** `self.config.raw` 只是「启动或上次 reload 时」的副本，磁盘若被 reload 之外的途径改过（AI 脚本直接写文件、手工编辑），它就是过期的——拿它改一个字段再整份写回，会把磁盘上的新增内容静默回滚。因此：
+
+- `POST /api/default`（切默认模型）、`GET /api/config`（面板读配置）都已改为**先读磁盘**（`load_raw_config()`，读失败才回退内存），磁盘有新的上游/模型时会被一并带进来。
+- 反向的坑同样存在：**AI/脚本直接改磁盘 ≠ 服务生效**，运行中的服务仍用内存快照（`/v1/models` 看不到新模型，切默认模型会被拒）。改完磁盘必须让服务 `reload`（走一次面板保存或 `POST /api/default`）或 `restart`。
+- 事故记录（2026-09-26）：菜单栏切默认模型被拒（服务内存里没有新加的 `cb-hy3`）→ 用户改点别的模型 → 旧快照整份写回 → 磁盘上的 `codebuddy` 上游 + 14 个 `cb-*` 模型被静默冲掉，Cline 下拉里 cb 系全部消失。
+
 ### 5.6 菜单栏 App
 - `.accessory` 策略 + `LSUIElement` → 不占 Dock。
 - 单实例保护：启动时若发现同 bundle id 多实例则自动退出。
-- 菜单每打开时重建（模型清单/日志尾部都是实时的）。
+- **状态栏标题**（`updateTitle()`）：极简，只有 `8.9%｜1,040` —— 火山**月度**已用占比 ｜ WorkBuddy **余额**（`total_remain` **取整**，用 `fuelInt()`，不显示小数）。不带 emoji/单位/模型数（用户明确要求跟系统菜单栏图标同一种克制风格）；某项无数据显示 `—`；月度窗口缺失时退回「最紧窗口」占比。完整信息（端口/默认模型/模型数/月度重置时间/积分占比）在 tooltip 里。
+- **菜单结构只建一次**（`buildFixedMenu()`），打开菜单只走 `menuWillOpen → refreshStatus()` 刷状态文本（<5ms，零重建）；子菜单内容由 60s 定时器重填。旧实现每次重建 16 个主项 + 4 个子菜单，实测 **146ms → 251ms**，系统繁忙时飙到 **5~7 秒**（2026-09-26 实测，bar.log 有据）。
+- **数据刷新统一 60 秒一轮**：服务状态 / 燃料 / 积分类共用 `tick()` 定时器（原来是 5s + 30s + 30s 三个定时器各刷各的）；服务启停的等待轮询（1.5s）只刷状态文本，不重建子菜单。「启动 / 停止服务」是固定两项，按运行状态灰显。
+- **主线程纪律（性能）**：所有 `launchctl` 调用（`agentLoaded`/`kickstart`/`bootout`/`bootstrap`，实测每次 20~45ms）**必须放后台线程**——早期只有 `start()` 后台化了，`stop` / `restart` / 开机自启 / 退出四处漏了，点一下菜单主线程会僵 0.1~1 秒，已修。`menuNeedsUpdate`（每次开菜单都跑）只允许做「缓存命中的读配置 + 读日志尾部 16KB + 内存快照拼字符串」，禁止任何同步网络请求。
+- **打点**：主线程中超 20ms 的操作会往 `bar.log` 写一行 `PERF <标签> <ms>ms`（见 `perfLog`/`measure`）。排查「点了怎么慢」先看这个文件；**没有 PERF 行 = 各动作都在 20ms 内**。
+- **重启/启动后的等待反馈**：`waitForRunning()` 每 1.5 秒轮询 `/health`（最多 36 秒），服务一亮就把图标切回 `● 运行中`，不用自己再点一次；`waitForStopped()` 同理用于停止。
 - 开机自启是**两个 LaunchAgent**：路由服务 + 菜单栏 App，由 App 菜单里的「开机自启」一并开关。
 - **拉起路由器的两条路径**：装了开机自启 → `launchctl kickstart`（launchd 有 KeepAlive 托底）；没装 → 直接用 `Process` 拉起 `Contents/MacOS/router --data-dir <AppSupport>`，并把 pid 写进 `router.pid`（停止时按 pid 杀，避免留孤儿进程）。
 
@@ -372,7 +383,7 @@ bash bar/build.sh install && launchctl kickstart -k gui/$(id -u)/com.wangcheng.c
 | 现象 | 根因 | 处置 |
 |---|---|---|
 | Cline 报 `invalid api key` | 客户端 Key 与 `auth_key` 不一致 | 面板口令清空（当前即如此，任意 Key 都过） |
-| Cline 报 `未知模型 'x'` | ID 写错或已改名 | 菜单栏 `⇄` →「模型」子菜单点按复制；或直接改用 `auto`（走默认模型） |
+| Cline 报 `未知模型 'x'` | ID 写错或已改名 | `bash cline-router.sh models` 核对清单；或直接改用 `auto`（走默认模型） |
 | `model=auto` 报"没有任何对话模型可路由" | 清单里没有对话模型 | 面板里先添加对话模型并保存 |
 | `HTTP 500 empty response content` | 推理模型 + `max_tokens` 太小 | Cline 里该模型 Max Output Tokens 调 ≥8192 |
 | `403 only available via Cline product surfaces` | 插件专属模型 | 只能走 Cline 客户端，无法用 API |
@@ -424,7 +435,14 @@ bash bar/build.sh install && launchctl kickstart -k gui/$(id -u)/com.wangcheng.c
 | 2026-09-25 | **auto 模式**：新增保留名 `auto`（路由到 `default_model`）、`only_auto` 开关（/v1/models 只暴露 auto）、`POST /api/default` 端点；面板加「默认模型」下拉与开关；菜单栏 App 加「默认模型」切换子菜单。Cline 里从此固定只填 auto |
 | 2026-09-25 | **打包成可分发的 .app / DMG**：`router.py` 增 `--data-dir`（数据目录可外置）；pyinstaller 把路由器冻成单文件二进制，与 Swift 菜单栏 App 一起打进 `Cline 路由.app`；首次启动自动迁移旧配置到 `~/Library/Application Support/ClineRouter/`；开机自启 plist 改为指向 .app 内二进制并整份重写；新增 `make_dmg.sh`（打 DMG + 挂载自检）。实测：从 `/tmp` 启动 .app → launchd 拉起内置冻结二进制 → 接管 4000 → 真实请求返回正文 ✓ |
 | 2026-09-25 | **菜单栏燃料 / 积分监控**：新增 `volc_fuel.py`（Agent Plan 燃料，AK/SK 签名）与 `workbuddy_credits.py`（积分 + 签到）；新增 `/api/fuel`、`/api/workbuddy`、`/api/workbuddy/refresh`、`/api/workbuddy/checkin` 四个端点；菜单栏新增「燃料」「积分」两行；配置面板删除上游时同步统计图片模型引用 |
+| 2026-09-26 | **状态栏余额取整**：WorkBuddy 余额改显示整数（`fuelInt()`，如 `1,040`），去掉小数；火山百分比仍保留一位小数（如 `8.9%`） |
+| 2026-09-26 | **状态栏极简**：标题只留 `8.9%｜1,045.73`（火山月度占比｜WorkBuddy 余额），去掉 `⇄` 图标与 ⛽/⚡ emoji、"月"字等说明（用户要求跟系统菜单栏同一种克制风格）；无数据显示 `—`；详情仍在 tooltip |
+| 2026-09-26 | **状态栏改为「火山月度占比 + WorkBuddy 余额」**（`⇄ ⛽月8.9% · ⚡1,045.73`），去掉模型个数；`menuWillOpen` 进一步减负：只刷状态文本（`refreshStatus()`，<5ms），子菜单内容交给 60s 定时器，实测由 40~58ms 降到 <5ms |
+| 2026-09-26 | **菜单固定化 + 刷新节奏统一**：菜单结构改为只建一次（`buildFixedMenu()`），打开时只刷文本（`menuWillOpen → refreshMenuData()`），彻底去掉 `menuNeedsUpdate` 的重建逻辑；服务状态/燃料/积分由三个定时器（5s/30s/30s）合并为 **60s 一轮**；「启动/停止服务」固定两项按状态灰显。实测旧版重建耗时 146 / 251 / 5395 / 7149ms（bar.log），新版预期 <20ms |
+| 2026-09-26 | **菜单栏交互提速**：`stop`/`restart`/开机自启/退出的 `launchctl` 同步调用全部移到后台线程（此前点这几项主线程要僵 0.1~1 秒）；新增 `waitForRunning()`/`waitForStopped()` 就绪轮询，重启后图标自动从 `⇄ ⏸` 变回运行中；`tailLog` 读取量 64KB→16KB；新增 PERF 打点（>20ms 写 `bar.log`）。另记签名坑：替换 `.app` 内二进制后只跑 `codesign --deep`，launchd 首次启动可能被判 `OS_REASON_CODESIGNING` 杀掉（退出码 -9），重试几次自愈；规范顺序是「先单签内层二进制，再 `--deep` 签 .app」 |
+| 2026-09-26 | **修事故：切默认模型把配置冲回旧版**。根因：`POST /api/default` 用 `dict(self.config.raw)`（进程启动时的内存快照）整份写盘，磁盘上 reload 之外的新增（`codebuddy` 上游 + 14 个 `cb-*` 模型）被静默回滚；且服务内存里没有 `cb-hy3` → 菜单栏点它 404（表现为"点了没反应"）。修复：新增 `load_raw_config()`，`POST /api/default` 与 `GET /api/config` 一律**先读磁盘**（读失败回退内存），校验也以磁盘模型表为准。恢复被冲掉的 `codebuddy` 上游与 14 个 cb 模型 |
 | 2026-09-26 | **补入腾讯混元 hy 系**：实测 CodeBuddy 上 `hy3` / `hy3-preview` / `hy4-preview` 可用（裸 `hy4` 不存在，混元在 CodeBuddy 里叫 `hyN` 不叫 hunyuan），新增 `cb-hy3` / `cb-hy3-preview` / `cb-hy4-preview`；响应 `usage.credit` 判明 hy3 系不扣分、hy4-preview 按量扣分（0.03~0.07/次）。对话模型 26 → 29。另发现 Cline 侧 `GET /api/v1/models` 可拉全量清单，其中 `tencent/hy*` 全需 Cline Credits |
 | 2026-09-26 | **补入 deepseek v4 系**：实测确认 CodeBuddy 有 `deepseek-v4.1-flash` / `deepseek-v4-flash` / `deepseek-v4-pro`（裸 `deepseek-v4.1`、`deepseek-v4-turbo` 均为 11102），新增 `cb-deepseek-v41-flash` / `cb-deepseek-v4-flash` / `cb-deepseek-v4-pro`，对话模型 23 → 26 |
 | 2026-09-26 | **接入 CodeBuddy 官方接口**：新增 `codebuddy.py` 适配层与上游 `mode` 字段（openai/codebuddy）；支持多 Key 轮换、流式强制与 SSE→非流式本地聚合、上游 11102 错误中文化；加入实测可用的 8 个 `cb-*` 模型；面板上游卡片新增接口类型/对话路径/密钥池/轮换周期；`router.spec` 把新模块加进 hiddenimports |
 | 2026-09-25 | **健壮性打磨**（体检后修复）：`RouterHTTPServer` 重写 `handle_error`（RST/EPIPE 只记一行 `CLIENT-DROP`，消除日志 Traceback 噪音）；启动 bind 撞 `EADDRINUSE` 重试 3 次后清晰退出；自检补 `/api/fuel`、`/api/workbuddy` 用例并用临时 `--data-dir` 隔离缓存 |
+| 2026-09-26 | **菜单栏精简**：删除「模型（N）」子菜单（只用于点按复制模型 ID，与「默认模型」子菜单重复），同步删掉 `copyModelId` 动作；查模型清单改用 `bash cline-router.sh models` |

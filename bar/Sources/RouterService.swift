@@ -162,7 +162,7 @@ struct RouterConfig {
 func tailLog(_ lines: Int, onlyRequests: Bool) -> [String] {
     guard let fh = FileHandle(forReadingAtPath: logPath) else { return [] }
     defer { try? fh.close() }
-    let maxBytes: UInt64 = 64 * 1024
+    let maxBytes: UInt64 = 16 * 1024
     let size = (try? fh.seekToEnd()) ?? 0
     let offset = size > maxBytes ? size - maxBytes : 0
     do {
@@ -264,7 +264,15 @@ final class RouterService {
         }
     }
 
+    /// 停止路由。launchctl print + bootout 都是同步阻塞（实测 print ~30ms、bootout 更久），
+    /// 一律放后台线程，避免点菜单后 UI 僵住（与 start() 保持一致）。
     func stop() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.stopSync()
+        }
+    }
+
+    private func stopSync() {
         if agentLoaded(routerLabel) {
             bootout(routerLabel)
         }
@@ -277,15 +285,19 @@ final class RouterService {
         try? FileManager.default.removeItem(atPath: pidPath)
     }
 
+    /// 重启路由。全程在后台线程串行执行（print → kickstart / stop → sleep → start），
+    /// 主线程只负责收到完成回调后刷新界面。
     func restart() {
-        if agentLoaded(routerLabel) {
-            kickstart(routerLabel, restart: true)
-            return
-        }
-        stop()
-        // 等旧进程释放端口（0.6s）后重启；放后台，避免 Thread.sleep 卡住菜单
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            self?.startSync()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            if agentLoaded(routerLabel) {
+                kickstart(routerLabel, restart: true)
+                return
+            }
+            self.stopSync()
+            // 等旧进程释放端口（0.6s）后再拉起
+            Thread.sleep(forTimeInterval: 0.6)
+            self.startSync()
         }
     }
 }

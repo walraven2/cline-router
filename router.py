@@ -300,6 +300,23 @@ def save_config_file(path, raw):
         pass
 
 
+def load_raw_config(path):
+    """读磁盘上的最新原始配置；读不出来返回 None（调用方自行回退内存快照）。
+
+    存在的意义：进程内存里的 Config.raw 只是「启动或上次 reload 时」的副本。
+    只要磁盘被 reload 之外的途径改过（AI 脚本直接写文件、面板之外的手工编辑），
+    内存副本就是过期的。任何「改一个字段再整份写回」的动作都必须以磁盘为准，
+    否则会把磁盘上的新增内容静默回滚（2026-09-26 事故：菜单栏切默认模型冲掉了
+    codebuddy 上游与全部 cb-* 模型）。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        return None
+
+
 def reload_config(path):
     """热加载配置；失败时保留旧配置并返回警告。"""
     with _CONFIG_LOCK:
@@ -402,7 +419,9 @@ class Router(BaseHTTPRequestHandler):
 
     # ---------------- 配置面板接口 ----------------
     def _config_payload(self):
-        raw = self.config.raw
+        # 以磁盘为准：面板若展示内存里的过期副本，用户一保存就会把磁盘上的
+        # 新增上游/模型覆盖掉（同 _handle_set_default 的坑）。
+        raw = load_raw_config(self.config.path) or self.config.raw
         return {
             "ok": True,
             "config_path": self.config.path,
@@ -509,14 +528,28 @@ class Router(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._send_json(400, {"error": {"message": "请求体不合法: %s" % exc}})
         mid = (payload.get("id") or "").strip()
-        if mid not in self.config.models:
+
+        # 关键：以磁盘最新配置为准（见 load_raw_config 的注释），绝不用内存快照写回。
+        disk_raw = load_raw_config(self.config.path)
+        if disk_raw is None:
+            disk_raw = dict(self.config.raw)
+            available = sorted(self.config.models)
+        else:
+            try:
+                available = sorted(Config(self.config.path).models)
+            except Exception:
+                available = sorted(
+                    (m.get("id") or "").strip() for m in (disk_raw.get("models") or [])
+                    if isinstance(m, dict) and (m.get("id") or "").strip()
+                )
+        if mid not in available:
             return self._send_json(404, {
-                "error": {"message": "未知对话模型 %r；可用: %s" % (mid, ", ".join(sorted(self.config.models)))}
+                "error": {"message": "未知对话模型 %r；可用: %s" % (mid, ", ".join(available))}
             })
-        raw = dict(self.config.raw)
-        raw["default_model"] = mid
+
+        disk_raw["default_model"] = mid
         try:
-            save_config_file(self.config.path, raw)
+            save_config_file(self.config.path, disk_raw)
         except Exception as exc:
             return self._send_json(500, {"error": {"message": "写入配置失败: %s" % exc}})
         warnings = reload_config(self.config.path)
