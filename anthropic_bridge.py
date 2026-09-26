@@ -22,8 +22,6 @@ Claude Code 侧配置：
 
 import json
 import os
-import re
-import socket
 import threading
 import time
 import urllib.error
@@ -88,6 +86,47 @@ def _system_text(system):
     return ""
 
 
+def _sanitize_tool_pairs(msgs):
+    """保证 tool_calls 与 tool 消息严格配对（不配对会被严格上游 400）。
+
+    OpenAI 要求「带 tool_calls 的 assistant 消息」后面紧跟它的**全部** tool 消息。
+    Claude Code 的历史里常出现三类不合法形态，火山 ARK 等严格上游会直接 400：
+      ① 某个 tool_use 没有对应 tool_result（历史被压缩 / 工具被打断）；
+      ② 孤立的 tool 消息（前面没有对应 tool_calls）；
+      ③ tool_calls 与 tool 消息数量不匹配。
+    这里统一修：删掉没有应答的 tool_call、删掉孤立的 tool 消息。
+    """
+    out = []
+    i, n = 0, len(msgs)
+    while i < n:
+        m = msgs[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            j = i + 1
+            following = []
+            while j < n and msgs[j].get("role") == "tool":
+                following.append(msgs[j])
+                j += 1
+            answered = set(t.get("tool_call_id") for t in following)
+            kept_calls = [c for c in m["tool_calls"] if c.get("id") in answered]
+            if kept_calls:
+                kept_ids = set(c.get("id") for c in kept_calls)
+                nm = dict(m)
+                nm["tool_calls"] = kept_calls
+                out.append(nm)
+                out.extend(t for t in following if t.get("tool_call_id") in kept_ids)
+            elif m.get("content"):
+                # 没有任何 tool 应答 → 退化成纯文本消息，避免上游 400
+                out.append({"role": "assistant", "content": m["content"]})
+            i = j
+            continue
+        if m.get("role") == "tool":
+            i += 1   # 孤立 tool 消息 → 丢弃
+            continue
+        out.append(m)
+        i += 1
+    return out
+
+
 def conv_messages(req):
     out = []
     sys_txt = _system_text(req.get("system"))
@@ -125,15 +164,23 @@ def conv_messages(req):
                 })
 
         text = "".join(texts)
+        tool_msgs = [{"role": "tool", "tool_call_id": tr["tool_call_id"],
+                      "content": tr["content"] or "(no output)"}
+                     for tr in tool_results]
         if role == "assistant" and tool_calls:
             msg = {"role": "assistant", "content": text or ""}
             msg["tool_calls"] = tool_calls
             out.append(msg)
-        elif text or not (tool_calls or tool_results):
-            out.append({"role": role, "content": text})
-        for tr in tool_results:
-            out.append({"role": "tool", "tool_call_id": tr["tool_call_id"], "content": tr["content"]})
-    return out
+            out.extend(tool_msgs)
+        else:
+            # tool 消息必须先发：OpenAI 要求「带 tool_calls 的 assistant」后面紧跟它的
+            # 全部 tool 消息。Claude Code 有时把 tool_result 和正文塞在同一条 user 消息里，
+            # 若先发正文，严格上游（火山 ARK 等）会 400：
+            # "An assistant message with 'tool_calls' must be followed by tool messages ..."
+            out.extend(tool_msgs)
+            if text or not tool_msgs:
+                out.append({"role": role, "content": text})
+    return _sanitize_tool_pairs(out)
 
 
 def conv_tools(req):

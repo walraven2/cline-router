@@ -47,8 +47,19 @@ class Mock(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            for piece in ["mo", "ck-", str(seen_model)]:
-                data = ("data: " + json.dumps({"choices": [{"delta": {"content": piece}}]}) + "\n\n").encode()
+            if payload.get("tools"):
+                # 工具调用响应：先开 function_call，再补 arguments，最后 finish
+                frames = [
+                    {"choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "id": "call_1", "function": {"name": "get_weather", "arguments": ""}}]}}]},
+                    {"choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "function": {"arguments": '{"city":"Beijing"}'}}]}}]},
+                    {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+                ]
+            else:
+                frames = [{"choices": [{"delta": {"content": piece}}]} for piece in ["mo", "ck-", str(seen_model)]]
+            for fr in frames:
+                data = ("data: " + json.dumps(fr) + "\n\n").encode()
                 self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
                 self.wfile.flush()
                 time.sleep(0.02)
@@ -211,6 +222,114 @@ def main():
                 failures.append("%s HTTP %s（期望 200，无凭据时应返回 ok=false）" % (ep, exc.code))
             except Exception as exc:
                 failures.append("%s 请求失败：%r" % (ep, exc))
+
+        # 9) 非流式 Responses API：翻译 + 聚合回 response object
+        with post(base + "/v1/responses", {"model": "alpha", "input": "hi", "stream": False}, ROUTER_KEY) as resp:
+            got = json.loads(resp.read())
+        if got.get("object") != "response":
+            failures.append("非流式 responses object 不符：%r" % got.get("object"))
+        if got.get("status") != "completed":
+            failures.append("非流式 responses status 应为 completed：%r" % got.get("status"))
+        out0 = (got.get("output") or [{}])[0]
+        if out0.get("type") != "message":
+            failures.append("非流式 responses 首个 output 应为 message：%r" % out0.get("type"))
+        ctext = "".join(b.get("text", "") for b in out0.get("content") or [] if isinstance(b, dict))
+        if "real-alpha" not in ctext:
+            failures.append("非流式 responses 正文未含上游模型名：%r" % ctext)
+
+        # 10) 流式 Responses API：事件序列 + completed 正文
+        with post(base + "/v1/responses", {"model": "beta", "input": "hi", "stream": True}, ROUTER_KEY) as resp:
+            ev_stream = resp.read().decode("utf-8", "replace")
+        events = []
+        for line in ev_stream.splitlines():
+            line = line.strip()
+            if line.startswith("event:"):
+                events.append(line[len("event:"):].strip())
+        if not events or events[0] != "response.created":
+            failures.append("流式 responses 首个事件应为 response.created，实际 %r" % events[:1])
+        if "response.output_text.delta" not in events:
+            failures.append("流式 responses 缺少 response.output_text.delta 事件")
+        if events[-1] != "response.completed":
+            failures.append("流式 responses 末事件应为 response.completed，实际 %r" % events[-1])
+        import re as _re
+        comp = None
+        for blk in ev_stream.split("event: "):
+            if blk.startswith("response.completed"):
+                dseg = blk.split("data: ", 1)[1].strip() if "data: " in blk else ""
+                try:
+                    comp = json.loads(dseg)
+                except Exception:
+                    comp = None
+        if comp is None:
+            failures.append("流式 responses 无法解析 completed 事件 data")
+        else:
+            # completed 事件结构：{"type":"response.completed","response":{...,"output":[...]}}
+            _resp = comp.get("response") if isinstance(comp.get("response"), dict) else comp
+            _out = (_resp.get("output") if isinstance(_resp, dict) else None) or [{}]
+            ctext = "".join(b.get("text", "") for b in _out[0].get("content", []) if isinstance(b, dict))
+            if "real-beta" not in ctext:
+                failures.append("流式 responses completed 正文不含上游模型名：%r" % ctext)
+
+        # 11) 工具调用 Responses API：function_call 翻译
+        with post(base + "/v1/responses", {"model": "alpha", "input": "hi",
+                   "tools": [{"type": "function", "name": "get_weather",
+                              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}],
+                   "stream": True}, ROUTER_KEY) as resp:
+            tool_stream = resp.read().decode("utf-8", "replace")
+        if "response.output_item.added" not in tool_stream:
+            failures.append("工具 responses 缺少 response.output_item.added")
+        else:
+            has_fc = False
+            for blk in tool_stream.split("event: response.output_item.added"):
+                if "function_call" in blk and "get_weather" in blk:
+                    has_fc = True
+                    break
+            if not has_fc:
+                failures.append("工具 responses 的 output_item.added 未含 function_call/get_weather")
+        if "response.function_call_arguments.done" not in tool_stream:
+            failures.append("工具 responses 缺少 response.function_call_arguments.done")
+
+        # 12) Responses 请求翻译：codex 工具历史（夹 reasoning / web_search_call 等
+        #     未知 item）不得破坏「assistant.tool_calls 紧跟其 tool 消息」的邻接要求。
+        #     回归背景：2026-09-26 未知类型被捏造成空 user 消息插在 function_call 与
+        #     function_call_output 之间 → 火山 ARK 400
+        #     "An assistant message with 'tool_calls' must be followed by tool messages"。
+        import responses_api as _ra
+        _msgs = _ra._input_items_to_messages("sys", [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "运行 pwd"}]},
+            {"type": "reasoning", "id": "rs_1"},
+            {"type": "function_call", "call_id": "call_a", "name": "shell", "arguments": "{}"},
+            {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+            {"type": "local_shell_call", "id": "ls_1", "status": "completed"},
+            {"type": "function_call", "call_id": "call_b", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_a", "output": "/tmp"},
+            {"type": "function_call_output", "call_id": "call_b", "output": "/tmp2"},
+        ])
+        _i, _n, _perr = 0, len(_msgs), None
+        _calls = sum(len(m.get("tool_calls") or []) for m in _msgs)
+        _tools = sum(1 for m in _msgs if m.get("role") == "tool")
+        while _i < _n:
+            _m = _msgs[_i]
+            if _m.get("role") == "assistant" and _m.get("tool_calls"):
+                _ids = sorted(c["id"] for c in _m["tool_calls"])
+                _j, _got = _i + 1, []
+                while _j < _n and _msgs[_j].get("role") == "tool":
+                    _got.append(_msgs[_j]["tool_call_id"])
+                    _j += 1
+                if sorted(_got) != _ids:
+                    _perr = "tool_calls %r 后只有 %r" % (_ids, sorted(_got))
+                    break
+                _i = _j
+            else:
+                if _m.get("role") == "tool":
+                    _perr = "孤立 tool 消息 %r" % _m.get("tool_call_id")
+                    break
+                _i += 1
+        if _perr:
+            failures.append("Responses 工具历史配对不合法：%s" % _perr)
+        if (_calls, _tools) != (2, 2):
+            failures.append("Responses 工具历史上下文丢失：tool_calls=%d tool=%d（期望 2/2）"
+                            % (_calls, _tools))
     finally:
         proc.terminate()
         mock.shutdown()
@@ -225,7 +344,7 @@ def main():
         for item in failures:
             print("  - " + item)
         return 1
-    print("PASS  cline-router 自检通过：模型列表 / 路由改写 / 上游密钥注入 / 流式透传 / 鉴权拦截 / auto 默认模型 / only_auto / 切换默认 / 监控端点")
+    print("PASS  cline-router 自检通过：模型列表 / 路由改写 / 上游密钥注入 / 流式透传 / 鉴权拦截 / auto 默认模型 / only_auto / 切换默认 / 监控端点 / Responses 翻译(非流式·流式·工具·工具历史配对)")
     return 0
 
 

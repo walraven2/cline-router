@@ -29,6 +29,7 @@ Cline（Model ID = auto）──> http://127.0.0.1:4000/v1 ──┬──> http
 |---|---|
 | `router.py` | **核心**。HTTP 服务：配置加载 / 路由 / 流式透传 / 图像生成 / 配置面板接口 / 热加载 |
 | `codebuddy.py` | CodeBuddy 官方协议的适配层（专用请求头 / 强制流式 / SSE→非流式聚合 / 多 Key 轮换） |
+| `responses_api.py` | **新增**。OpenAI Responses API ⇄ Chat Completions 双向翻译（Codex / `wire_api="responses"` 用）：请求侧 `input`/`instructions`/`tools` 翻成 chat；流式侧把 chat SSE 翻成 `response.created → output_item.added → output_text.delta → response.completed` 事件序列（含 `function_call` 工具调用） |
 | `admin_ui.py` | 配置面板的 HTML+CSS+JS（纯字符串常量，无模板引擎） |
 | `volc_fuel.py` | 火山方舟 Agent Plan「燃料」余额查询（AK/SK 签名）+ daemon 定时刷新 + 缓存 |
 | `workbuddy_credits.py` | WorkBuddy / CodeBuddy「积分」查询（令牌发现 + 签到）+ daemon 定时刷新 + 缓存 |
@@ -190,6 +191,7 @@ bash ~/Cline 路由/make_template.sh   # 从 models.json 生成脱敏模板，�
 | POST | `/api/workbuddy/checkin` | 需头 `X-Router-UI: 1` | 每日签到并刷新积分 |
 | GET | `/v1/models` | 无 | `only_auto=true` 时**只返回 auto**；否则列全部对话模型（图片模型始终不列） |
 | POST | `/v1/chat/completions` | `auth_key` 非空时才校验 | 按 `model` 路由；SSE 逐块透传 |
+| POST | `/v1/responses` | `auth_key` 非空时才校验 | Responses API ⇄ Chat Completions 翻译（Codex 用）；支持流式 SSE 事件序列与 `function_call` 工具调用，非流式则本地聚合成完整 response 对象 |
 | POST | `/v1/images/generations` | 同上 | 按 `model` 路由到上游 images 接口 |
 
 鉴权：`Authorization` 支持 `Bearer <key>` 与裸 `<key>`，大小写不敏感；`auth_key` 为空时**全部放行**。
@@ -259,6 +261,17 @@ CodeBuddy 官方服务**不是** OpenAI 兼容的，直接用通用 OpenAI 通�
 ### 5.10 连接健壮性（启动与断连）
 - 客户端在读请求行前/写响应中途断开（Cline 取消请求、健康探针提前关闭）由 `RouterHTTPServer.handle_error` 降噪：只记一行 `CLIENT-DROP`，不再打整段 Traceback。
 - 启动 bind 撞 `EADDRINUSE`（.app 的 launchd KeepAlive 与手动启动抢端口）时**重试 3 次 × 1.5s**（每次重建 server 对象），仍失败则打印占用提示（含 `lsof` 命令）后退出。
+
+### 5.11 Responses API 翻译（`/v1/responses`，Codex 用）
+新版 Codex CLI 只认 OpenAI **Responses API**（`wire_api="responses"`），而本路由只实现 `/v1/chat/completions`。`/v1/responses` 端点把两者互译，让 Codex 直接打本地路由：
+- **请求侧**（`responses_api.to_chat_request`）：`instructions` → system message；`input`（string 或 item 数组）拍平成 chat `messages`；`tools` 展开成嵌套 `function` 格式（非 `function` 类型如 `web_search`/`local_shell` 上游大多不支持 → 丢弃并告警）；`reasoning.effort` → `reasoning_effort`。**强制 `stream: true`** 打上游（上游一律走流式，非流式由本路由本地聚合）。
+- **请求侧消息翻译的三条铁律**（决定性，踩过 400）：
+  1. 只翻 `message` / `function_call` / `function_call_output` 三类 item；**其余类型（`reasoning`/`item_reference`/`local_shell_call`/`web_search_call`/`custom_tool_call`/`mcp_call` …）一律跳过**。⚠️ 绝不能把未知类型捏造成（空的）user 消息 —— codex 的历史里 `function_call` 与 `function_call_output` 之间常夹着 `reasoning`/`web_search_call`，捏造出的空 user 消息插进去就破坏了邻接要求，严格上游（火山 ARK）直接 400：`An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'`。
+  2. codex 的**并行工具调用是多个独立 `function_call` item**，必须**合并进同一条** assistant 消息（合并 `tool_calls`），否则会变成多条相邻的 `assistant(tool_calls)`，各自都配不齐 tool 应答 → 被净化丢弃，上下文静默丢失。
+  3. 结尾统一过 `_sanitize_tool_pairs()` 净化：删掉没有应答的 `tool_call`、删掉孤立的 `tool` 消息。`anthropic_bridge.conv_messages` 有同一份逻辑（Claude 侧踩过完全相同的 400）。`selftest.py` 第 12 条断言守这条回归。
+- **流式响应侧**（`ResponsesStreamTranslator`）：把上游 chat SSE 翻成 Codex 期待的事件序列 —— `response.created` → `response.in_progress` → `response.output_item.added` → `response.content_part.added` → `response.output_text.delta`（多个）→ `response.output_text.done` → `response.content_part.done` → `response.output_item.done` → `response.completed`；工具调用走 `response.output_item.added`(function_call) → `response.function_call_arguments.delta` → `response.function_call_arguments.done` → `response.output_item.done`。文本与工具 item 用 `output_index` 严格配对，顺序稳定。
+- **非流式响应侧**：上游 SSE 在本路由聚合成完整 chat completion，再用 `to_response_object` 翻成 Responses object（含 `output` 数组、`usage`、`status`，`length` 截断时标 `incomplete`）。
+- 事件名以 Codex 二进制 `strings` 提取的最小集为准（已实测 `response.completed` 等），如 Codex 升级后缺某事件再补。
 
 ---
 
@@ -388,6 +401,11 @@ bash cline-router.sh models
 curl -s -m 60 http://127.0.0.1:4000/v1/chat/completions \
   -H "Authorization: Bearer x" -H 'Content-Type: application/json' \
   -d '{"model":"volc-doubao-mini","messages":[{"role":"user","content":"回两个字：收到"}],"max_tokens":800}'
+
+# 5b) Responses API（Codex 走这条；wire_api="responses"）
+curl -s -m 60 http://127.0.0.1:4000/v1/responses \
+  -H "Authorization: Bearer x" -H 'Content-Type: application/json' \
+  -d '{"model":"auto","input":"回两个字：收到","stream":true}'
 
 # 6) 涉及菜单栏 App 时重新编译安装
 bash bar/build.sh install && launchctl kickstart -k gui/$(id -u)/com.wangcheng.cline-router-bar

@@ -27,6 +27,7 @@ Cline 侧只填一个 OpenAI Compatible 配置：
     GET  /health                   健康检查
     GET  /v1/models                对话模型列表（图像模型不混进来，避免 Cline 误选）
     POST /v1/chat/completions      按 model 路由对话请求（含 SSE 流式透传）
+    POST /v1/responses             按 model 路由对话请求（Responses API ⇄ Chat 翻译，Codex 用）
     POST /v1/images/generations    按 model 路由图像生成请求（OpenAI images 协议）
 
 零第三方依赖，Python 3.9+ 可用。仅监听本机地址，不对外暴露。
@@ -59,6 +60,7 @@ import admin_ui
 import codebuddy
 import volc_fuel
 import workbuddy_credits
+import responses_api
 
 # 路径策略：
 #   - 源码模式（python3 router.py 或 bash cline-router.sh start）：HERE 取源码目录，
@@ -66,7 +68,6 @@ import workbuddy_credits
 #   - .app 模式（冻成二进制塞进 Cline 路由.app/Contents/MacOS/router）：__file__ 在 .app 内，
 #     该目录用户不可写，必须显式 --data-dir 指向 ~/Library/Application Support/ClineRouter。
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CONFIG = os.path.join(HERE, "models.json")
 IMAGES_DIR = os.path.join(HERE, "images")
 STARTED_AT = time.time()
 
@@ -731,6 +732,132 @@ class Router(BaseHTTPRequestHandler):
         log("OK %s -> %s [%s] %s %.1fs %dB（流式已聚合）" % (
             mid, entry["model"], upstream_name, code, time.time() - started, len(raw)))
 
+    # ---------------- Responses API（Codex 等，wire_api="responses"）----------------
+    def _resolve_model(self, mid):
+        """返回 (entry, up, error_msg)；error_msg 非空时调用方直接 404。"""
+        if mid.lower() == "auto" or not mid:
+            if not self.config.default_model:
+                return None, None, "model=auto 但没有任何对话模型可路由，请先在配置里添加对话模型"
+            mid = self.config.default_model
+        entry = self.config.models.get(mid)
+        if not entry:
+            hint = "（%s 是图片模型，请走 /v1/images/generations）" % mid if self.config.images.get(mid) else ""
+            default_tip = "；填 auto 可用默认模型 %s" % self.config.default_model if self.config.default_model else ""
+            return None, None, "未知模型 %r%s；可用: %s%s" % (mid, hint, ", ".join(sorted(self.config.models)), default_tip)
+        return entry, self.config.upstreams[entry["upstream"]], None
+
+    def _handle_responses(self, payload):
+        """POST /v1/responses：Responses API ⇄ Chat Completions 翻译（Codex 用）。"""
+        mid = (payload.get("model") or "").strip()
+        entry, up, err = self._resolve_model(mid)
+        if err:
+            return self._send_json(404, {"error": {"message": err}})
+        client_stream = bool(payload.get("stream"))
+        try:
+            chat = responses_api.to_chat_request(payload, entry["model"])
+        except Exception as exc:
+            return self._send_json(400, {"error": {"message": "请求翻译失败: %s" % exc}})
+
+        started = time.time()
+        up_name = up.get("name", "?")
+        if up["mode"] == codebuddy.MODE:
+            # CodeBuddy 上游要专属请求头，走适配层开流；返回的已是标准 OpenAI SSE
+            status, resp, e = self._cb_open(up, chat)
+            if status == 0:
+                log("FAIL responses %s [%s] 连接上游失败: %s" % (entry["model"], up_name, e[:200]))
+                return self._send_json(502, {"error": {"message": "连接上游失败: %s" % e[:300]}})
+            if resp is None:
+                log("FAIL responses %s [%s] 上游 HTTP %s" % (entry["model"], up_name, status))
+                return self._send_json(status, codebuddy.translate_error(status, e))
+        else:
+            body = json.dumps(chat, ensure_ascii=False).encode("utf-8")
+            headers = build_headers(up, self.headers.get("User-Agent"))
+            req = urllib.request.Request(up["base_url"] + (up["path"] or "/chat/completions"),
+                                         data=body, headers=headers, method="POST")
+            try:
+                resp = build_opener(up).open(req, timeout=up["timeout"])
+            except urllib.error.HTTPError as exc:
+                detail = exc.read()
+                log("FAIL responses %s [%s] 上游 HTTP %s" % (entry["model"], up_name, exc.code))
+                self.send_response(exc.code)
+                self.send_header("Content-Type", exc.headers.get("Content-Type") or "application/json")
+                self.send_header("Content-Length", str(len(detail)))
+                self.end_headers()
+                self.wfile.write(detail)
+                return
+            except Exception as exc:
+                log("FAIL responses %s [%s] 连接上游失败: %r" % (entry["model"], up_name, exc))
+                return self._send_json(502, {"error": {"message": "连接上游失败: %r" % exc}})
+
+        if client_stream:
+            return self._relay_responses_stream(resp, entry["model"], entry, started, up_name)
+        return self._relay_responses_aggregated(resp, entry["model"], entry, started, up_name)
+
+    def _relay_responses_stream(self, resp, mid, entry, started, up_name):
+        """把上游的 Chat SSE 翻译成 Responses SSE 事件流并 chunked 写回。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        tr = responses_api.ResponsesStreamTranslator(self._write_chunk, mid)
+        tr.begin()
+        try:
+            for chunk in responses_api.iter_sse_lines(resp):
+                tr.feed(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            log("CANCEL responses %s 客户端中断" % mid)
+            return
+        except Exception as exc:
+            log("ERR responses %s 流处理异常: %r" % (mid, exc))
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        try:
+            tr.end(tr.finish)
+        except Exception as exc:
+            log("ERR responses %s 收尾异常: %r" % (mid, exc))
+        self._end_chunks()
+        log("OK responses %s -> %s [%s] 流完成" % (mid, entry["model"], up_name))
+
+    def _relay_responses_aggregated(self, resp, mid, entry, started, up_name):
+        """非流式：把上游 Chat SSE 聚合成完整 Responses object 写回。"""
+        chunks = list(responses_api.iter_sse_lines(resp))
+        try:
+            resp.close()
+        except Exception:
+            pass
+        chat_resp, usage = responses_api.aggregate_chat_stream(chunks)
+        chat_resp["model"] = mid
+        if usage:
+            chat_resp["usage"] = usage
+        obj = responses_api.to_response_object(chat_resp, mid)
+        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+        log("OK responses %s -> %s [%s] %.1fs %dB（非流式已聚合）" % (mid, entry["model"], up_name, time.time() - started, len(raw)))
+
+    def _write_chunk(self, data):
+        """chunked 编码写一个 SSE 事件块。"""
+        try:
+            self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+
+    def _end_chunks(self):
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except Exception:
+            pass
+
     # ---------------- UI 与只读端点 ----------------
     def _fuel_payload(self):
         """火山方舟 Agent Plan 燃料余额（读常驻刷新器的内存快照，不阻塞）"""
@@ -814,8 +941,17 @@ class Router(BaseHTTPRequestHandler):
             return self._handle_image(from_ui=True)
         if path in ("/v1/images/generations", "/images/generations"):
             return self._handle_image(from_ui=False)
+        if path.endswith("/responses"):
+            if not self._auth_ok():
+                return self._send_json(401, {"error": {"message":
+                    "invalid api key —— Cline 的 API Key 需与路由器面板里的「本机口令」一致（或在面板里把口令清空）"}})
+            try:
+                payload = self._read_json_body()
+            except Exception as exc:
+                return self._send_json(400, {"error": {"message": "请求体不是合法 JSON: %s" % exc}})
+            return self._handle_responses(payload)
         if not path.endswith("/chat/completions"):
-            return self._send_json(404, {"error": {"message": "只支持 /v1/chat/completions 与 /v1/images/generations"}})
+            return self._send_json(404, {"error": {"message": "只支持 /v1/chat/completions 、/v1/images/generations 与 /v1/responses"}})
         if not self._auth_ok():
             return self._send_json(401, {"error": {"message":
                 "invalid api key —— Cline 的 API Key 需与路由器面板里的「本机口令」一致（或在面板里把口令清空）"}})
@@ -826,24 +962,9 @@ class Router(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": {"message": "请求体不是合法 JSON: %s" % exc}})
 
         mid = (payload.get("model") or "").strip()
-        if mid.lower() == "auto" or not mid:  # 保留名 auto（以及空 model）→ 当前默认模型
-            if not self.config.default_model:
-                return self._send_json(404, {
-                    "error": {"message": "model=auto 但没有任何对话模型可路由，请先在配置里添加对话模型"}
-                })
-            mid = self.config.default_model
-            payload["model"] = mid
-        entry = self.config.models.get(mid)
-        if not entry:
-            hint = ""
-            if self.config.images.get(mid):
-                hint = "（%s 是图片模型，请走 /v1/images/generations）" % mid
-            default_tip = "；填 auto 可用默认模型 %s" % self.config.default_model if self.config.default_model else ""
-            return self._send_json(404, {
-                "error": {"message": "未知模型 %r%s；可用: %s%s" % (mid, hint, ", ".join(sorted(self.config.models)), default_tip)}
-            })
-
-        up = self.config.upstreams[entry["upstream"]]
+        entry, up, err = self._resolve_model(mid)
+        if err:
+            return self._send_json(404, {"error": {"message": err}})
         payload["model"] = entry["model"]  # 把本地别名换成上游真实模型名
 
         # CodeBuddy 官方协议不走标准 OpenAI 通道：要专用请求头、强制流式，非流式需本地聚合
