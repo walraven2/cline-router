@@ -1,0 +1,66 @@
+# cline-router 维护铁律（AI 接手必读）
+
+本目录是一个**常驻本机的小程序**（Python 3.9 + Swift 菜单栏 App），不是一次性脚本。
+接手维护前先通读 `README.md`，然后遵守以下硬规则。
+
+## 一、改代码的完成标准（缺一步都不算完成）
+
+1. 改完 `router.py` / `admin_ui.py` 必须跑，且必须 PASS：
+   `python3 -c "import py_compile; py_compile.compile('router.py', doraise=True)"` 与 `python3 selftest.py`
+2. 改完必须重启并**真实调用验证**：
+   `bash cline-router.sh restart` 然后 `curl` 发一次真实对话请求拿到正常正文。
+   **端口监听 / curl 200 / 进程存在都不算验证通过。**
+3. 改了配置结构 → 同步更新面板的保存与校验逻辑 + `README.md` 的对应章节。
+4. 改了菜单栏 App（`bar/Sources/*.swift`）→ `bash bar/build.sh install` 并
+   `launchctl kickstart -k gui/$(id -u)/com.wangcheng.cline-router-bar`，再 `--check` 验证。
+
+## 二、绝对不能做的事
+
+1. **不把任何 API Key 写进代码、文档、日志、注释、Git**。密钥只允许存在 `models.json`（保持 `600` 权限；
+   面板保存走 `save_config_file()`，里面有 `os.chmod(path, 0o600)`，不要删掉它）。
+   排查时打印 Token 必须打码（现有 `AUTH 拒绝` 日志只记前 4 字符，照此风格）。
+2. **不改 LaunchAgent 的 label**：`com.wangcheng.cline-router`、`com.wangcheng.cline-router-bar`。
+3. **不删除**这三处防护：菜单栏单实例保护、写接口的 `X-Router-UI: 1` 头校验、`/images/` 的 basename 防目录穿越。
+4. **不把图片模型加进 `/v1/models`**（会让 Cline 把它当对话模型选中并报错）。
+5. **不把监听地址改成 `0.0.0.0`**（服务无强鉴权，只允许 `127.0.0.1`）。
+6. **不手工改 VS Code 的 `state.vscdb`**。
+7. 不用 `docker restart` 那套思路瞎折腾 —— 本程序是 **launchd 托管**，启停一律走
+   `bash cline-router.sh {start|stop|restart}`（它内部会判断 launchd 是否接管）。
+8. **不要把程序目录搬进 `~/Desktop` / `~/Documents` / `~/Downloads`**：macOS TCC 会禁止 launchd
+   执行这些目录里的文件，症状是 `launchctl print` 里 `last exit code = 78: EX_CONFIG` 而手动运行正常。
+   程序目录固定 `~/Cline 路由`，桌面只放 Finder 别名（别名不参与任何脚本逻辑）。
+
+## 三、契约（改了就是破坏兼容，必须同时改客户端说明）
+
+- 对外协议固定：`POST /v1/chat/completions`（SSE 逐块透传，不改写任何响应字段）、
+  `POST /v1/images/generations`、`GET /v1/models`、`GET /health`、`GET /ui`、
+  `POST /api/config`、`POST /api/test`、`POST /api/image`、`GET /images/<文件>`。
+- Cline 侧固定填：Base URL `http://127.0.0.1:4000/v1`，API Key 任意值。
+- 模型 `id` 命名即契约（Cline 下拉里靠它选模型）：
+  `cline-free-*` = 实测 cost=0 免费；`cline-paid-*` = 按量计费；`volc-*` = 火山套餐内。
+  **新增模型前必须先实测 `usage.cost` 再决定用哪个前缀**，不要凭猜。
+- 切换模型是改 `models.json` 的 `id`/`model` 对，**不要改 router 的代码去硬编码模型**。
+
+## 四、上游知识（别重新踩一遍）
+
+- 火山 Agent Plan：`https://ark.cn-beijing.volces.com/api/plan/v3`，**必须用 Agent Plan 专属 Key**
+  （平台 Key 会 401）；模型 ID 用小写连字符；`/models` 是 404；图片走同 Base URL 的 `/images/generations`。
+- Cline 官方：`https://api.cline.bot/api/v1`，上游需 `"unwrap_data": true`（非流式带 `{"data":...}` 信封）；
+  **Cline 客户端的 FREE 档不适用于 API**（同模型客户端 $0.0000、API 计费）；
+  部分模型是插件专属（403 `only available via Cline product surfaces`），无论怎么配都用不了。
+- 推理型模型（deepseek 系、kimi 系、火山多数）必须给足输出 token，否则"思考吃光 token、正文为空"→ 上游报
+  `500 empty response content`。Cline 里要把 Max Output Tokens 调到 ≥8192。
+
+## 五、改动的推荐路径
+
+- 加模型 → 改 `models.json` 的 `models`/`images` 数组 + 重启 + 实测（先测计费！）。
+- 加上游 → 在 `upstreams` 里加一块（`base_url`/`api_key`/`timeout`，必要时 `headers`/`proxy`/`unwrap_data`），
+  不改 Python 代码。
+- 加端点/改协议 → 改 `router.py` + 更新 `README.md` §4，并**加一条 `selftest.py` 断言**保证不被改坏。
+- 面板 UI → 只改 `admin_ui.py`（纯字符串），保持现有暗色风格与 class 命名。
+
+## 六、安全与隐私
+
+- 用户机器的 API Key 视为机密：不复制、不外传、不写进回答正文。
+- 日志里出现 Key 一律打码；新增日志时沿用现有风格（时间戳 + 级别 + 摘要）。
+- 做完改动后向用户汇报时，**说明改了什么、怎么验证的、有没有花钱风险（计费模型）**。

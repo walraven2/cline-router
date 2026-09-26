@@ -1,0 +1,22 @@
+# ---------- 密钥 / 运行时配置（绝不入库）----------
+models.json
+models.json.bak
+volc-fuel.json
+*-cache.json
+*.log
+
+# ---------- 构建产物 ----------
+build/
+bar/build/
+bar/dist/
+Cline 路由.app/
+*.icns
+*.pyc
+__pycache__/
+
+# ---------- 生成内容 ----------
+images/*
+!images/.gitkeep
+
+# ---------- macOS ----------
+.DS_Store

@@ -1,0 +1,118 @@
+{
+  "host": "127.0.0.1",
+  "port": 4000,
+  "auth_key": "",
+  "default_model": "volc-deepseek41",
+  "only_auto": true,
+  "upstreams": {
+    "volc": {
+      "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+      "api_key": "",
+      "timeout": 900
+    },
+    "cline": {
+      "base_url": "https://api.cline.bot/api/v1",
+      "unwrap_data": true,
+      "api_key": "",
+      "timeout": 900
+    },
+    "myapi": {
+      "base_url": "https://改成你自己的网关地址/v1",
+      "api_key": "",
+      "timeout": 900,
+      "headers": {},
+      "proxy": ""
+    }
+  },
+  "models": [
+    {
+      "id": "cline-free-minimax",
+      "upstream": "cline",
+      "model": "minimax/minimax-m3"
+    },
+    {
+      "id": "cline-free-nemotron",
+      "upstream": "cline",
+      "model": "nvidia/nemotron-3-super-120b-a12b:free"
+    },
+    {
+      "id": "cline-free-laguna",
+      "upstream": "cline",
+      "model": "poolside/laguna-s-2.1:free"
+    },
+    {
+      "id": "cline-free-north",
+      "upstream": "cline",
+      "model": "cohere/north-mini-code:free"
+    },
+    {
+      "id": "cline-free-nemotron-ultra",
+      "upstream": "cline",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b:free"
+    },
+    {
+      "id": "cline-free-nemotron-light",
+      "upstream": "cline",
+      "model": "nvidia/nemotron-3.5-lightning:free"
+    },
+    {
+      "id": "cline-free-nexpro",
+      "upstream": "cline",
+      "model": "nex-agi/nex-n2.5-pro:free"
+    },
+    {
+      "id": "cline-free-bunny",
+      "upstream": "cline",
+      "model": "stealth/space-bunny-alpha"
+    },
+    {
+      "id": "cline-free-mimo",
+      "upstream": "cline",
+      "model": "xiaomi/mimo-v2.6-flash"
+    },
+    {
+      "id": "volc-doubao-mini",
+      "upstream": "volc",
+      "model": "doubao-seed-2.0-mini"
+    },
+    {
+      "id": "volc-deepseek41",
+      "upstream": "volc",
+      "model": "deepseek-v4.1-flash"
+    },
+    {
+      "id": "volc-kimi-k28",
+      "upstream": "volc",
+      "model": "kimi-k2.8-preview"
+    },
+    {
+      "id": "volc-kimi-code",
+      "upstream": "volc",
+      "model": "kimi-k2.7-code"
+    },
+    {
+      "id": "volc-minimax",
+      "upstream": "volc",
+      "model": "minimax-m3"
+    },
+    {
+      "id": "volc-kimi-k3",
+      "upstream": "volc",
+      "model": "kimi-k3"
+    }
+  ],
+  "images": [
+    {
+      "id": "seedream-pro",
+      "upstream": "volc",
+      "model": "doubao-seedream-5.0-pro",
+      "size": "1024x1024"
+    },
+    {
+      "id": "seedream-lite",
+      "upstream": "volc",
+      "model": "doubao-seedream-5.0-lite",
+      "size": "2048x2048"
+    }
+  ]
+}
