@@ -239,7 +239,7 @@ function renderUpstreams(){
       + '<div class="row"><label>Base URL</label><input data-kind="up" data-key="' + esc(n) + '" data-field="base_url" value="' + esc(u.base_url||'') + '" placeholder="' + (cb ? 'https://copilot.tencent.com' : 'https://example.com/v1') + '"></div>'
       + '<div class="row"><label>API Key</label><input data-kind="up" data-key="' + esc(n) + '" data-field="api_key" type="password" value="' + esc(u.api_key||'') + '" placeholder="可写 ${ENV_VAR} 从环境变量取"></div>'
       + '<div class="row"><label>对话路径</label><input data-kind="up" data-key="' + esc(n) + '" data-field="path" value="' + esc(u.path||'') + '" placeholder="' + (cb ? '/v2/chat/completions（留空即用此默认值）' : '/chat/completions（留空即用此默认值）') + '"></div>'
-      + '<div class="row"><label>密钥池(轮换)</label><textarea data-kind="up" data-key="' + esc(n) + '" data-field="api_keys" placeholder="一行一把 Key；留空则只用上面那把单 Key。多把时会轮流用，分摊限流">' + esc((u.api_keys||[]).join('\n')) + '</textarea></div>'
+      + '<div class="row"><label>密钥池(轮换)</label><textarea data-kind="up" data-key="' + esc(n) + '" data-field="api_keys" placeholder="一行一把 Key；留空则只用上面那把单 Key。多把时会轮流用，分摊限流">' + esc((u.api_keys||[]).join('\\n')) + '</textarea></div>'
       + '<div class="row"><label>轮换周期</label><input data-kind="up" data-key="' + esc(n) + '" data-field="rotation_count" value="' + esc(u.rotation_count||1) + '" placeholder="每 N 次请求换下一把 Key，默认 1"></div>'
       + '<div class="row"><label>超时(秒)</label><input data-kind="up" data-key="' + esc(n) + '" data-field="timeout" value="' + esc(u.timeout||900) + '"></div>'
       + '<div class="row"><label>代理(可选)</label><input data-kind="up" data-key="' + esc(n) + '" data-field="proxy" value="' + esc(u.proxy||'') + '" placeholder="如 http://127.0.0.1:7890"></div>'
@@ -279,7 +279,7 @@ document.addEventListener('input', function(e){
     } else if (f === 'timeout'){ up.timeout = parseInt(el.value, 10) || 900; }
     else if (f === 'rotation_count'){ up.rotation_count = parseInt(el.value, 10) || 1; }
     else if (f === 'api_keys'){
-      var keys = String(el.value).split(/[\n,;]+/).map(function(s){ return s.trim(); }).filter(Boolean);
+      var keys = String(el.value).split(/[\\n,;]+/).map(function(s){ return s.trim(); }).filter(Boolean);
       if (keys.length) up.api_keys = keys; else delete up.api_keys;
     }
     else { up[f] = el.value; }

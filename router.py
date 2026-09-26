@@ -19,7 +19,8 @@ Cline 侧只填一个 OpenAI Compatible 配置：
     POST /api/test                 连通性测试单个对话模型（面板用）
     POST /api/image                生成图片并存到本地（面板用）
     GET  /images/<file>            查看已生成的图片
-    GET  /api/fuel                 火山方舟 Agent Plan 燃料余额（菜单栏用）
+    GET  /api/fuel                 火山方舟 Agent Plan 燃料余额（菜单栏用，读内存快照）
+    POST /api/fuel/refresh         立即拉取一次燃料（菜单栏用，需 X-Router-UI 头）
     GET  /api/workbuddy            WorkBuddy / CodeBuddy 积分余额（菜单栏用）
     POST /api/workbuddy/refresh    立即刷新积分（菜单栏用，需 X-Router-UI 头）
     POST /api/workbuddy/checkin    每日签到并刷新积分（菜单栏用，需 X-Router-UI 头）
@@ -743,6 +744,12 @@ class Router(BaseHTTPRequestHandler):
         """WorkBuddy / CodeBuddy 积分余额（读常驻刷新器的内存快照，不阻塞）"""
         return workbuddy_credits.current_snapshot()
 
+    def _handle_fuel_refresh(self):
+        """手动触发一次燃料刷新：真的去拉上游（约 1~15 秒），不是读缓存。"""
+        if not self._ui_ok():
+            return self._send_json(403, {"error": {"message": "缺少 X-Router-UI 头（防跨站请求）"}})
+        return self._send_json(200, volc_fuel.manual_refresh())
+
     def _handle_workbuddy_refresh(self):
         """手动触发一次积分刷新（同步等接口返回，约 1~3 秒）。"""
         if not self._ui_ok():
@@ -795,6 +802,8 @@ class Router(BaseHTTPRequestHandler):
             return self._handle_save_config()
         if path == "/api/default":
             return self._handle_set_default()
+        if path == "/api/fuel/refresh":
+            return self._handle_fuel_refresh()
         if path == "/api/workbuddy/refresh":
             return self._handle_workbuddy_refresh()
         if path == "/api/workbuddy/checkin":

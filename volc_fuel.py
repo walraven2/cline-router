@@ -339,15 +339,22 @@ def main():
 
 
 class FuelMonitor:
-    """常驻刷新器：定期拉取 AFP 余额，缓存到内存 + fuel-cache.json（供菜单栏/面板读）。"""
+    """常驻刷新器：定期拉取 AFP 余额，缓存到内存 + fuel-cache.json（供菜单栏/面板读）。
 
-    def __init__(self, interval=300):
+    失败策略：任何一次拉取失败都必须写日志 —— 状态栏与面板都只读这份快照，
+    静默失败的表现是左侧退回「—」，看起来像"没数据"而不是"出错"，极易被忽略。
+    失败后把下一轮间隔缩短到 retry_interval，恢复成功再自动回到 interval。
+    """
+
+    def __init__(self, interval=300, retry_interval=60):
         self.interval = max(60, int(interval or 300))
+        self.retry_interval = max(15, int(retry_interval or 60))
         self.ak, self.sk, self.source = load_credentials(argparse.Namespace(ak=None, sk=None))
         self._lock = threading.Lock()
         self._snap = None
         self._stop = threading.Event()
         self._thread = None
+        self._fail_streak = 0
 
     @property
     def enabled(self):
@@ -368,22 +375,38 @@ class FuelMonitor:
             snap = snapshot_of(self.ak, self.sk)
         except Exception as exc:  # noqa: BLE001 - 失败也落缓存，避免 UI 静默显示旧值
             snap = fail_snapshot(str(exc))
-        with self._lock:
-            self._snap = snap
         try:
             write_cache(snap)
-        except OSError:
-            pass
+        except OSError as exc:
+            log("写缓存失败: %s" % exc)
+        with self._lock:
+            self._snap = snap
+            if snap.get("ok"):
+                recovered, self._fail_streak = self._fail_streak, 0
+            else:
+                recovered, self._fail_streak = 0, self._fail_streak + 1
+            streak = self._fail_streak
+        if recovered:
+            log("刷新恢复：连续失败 %d 次后成功" % recovered)
+        elif streak:
+            log("刷新失败(第 %d 次): %s → %ds 后重试"
+                % (streak, snap.get("error") or "未知错误", self.retry_interval))
         return snap
 
     def snapshot(self):
         with self._lock:
             return self._snap
 
+    @property
+    def next_interval(self):
+        """下一轮等待时长：失败连击时缩短，尽快自愈。"""
+        with self._lock:
+            return self.interval if self._fail_streak == 0 else self.retry_interval
+
     def _loop(self):
         while not self._stop.is_set():
             self.refresh()
-            self._stop.wait(self.interval)
+            self._stop.wait(self.next_interval)
 
 
 _MONITOR = None
@@ -401,6 +424,17 @@ def start_monitor(interval=300, data_dir=None):
 
 def current_snapshot():
     return _MONITOR.snapshot() if _MONITOR else None
+
+
+def manual_refresh():
+    """手动触发一次刷新（同步等上游返回，约 1~15 秒），返回刷新后的快照。
+
+    菜单栏「立即刷新燃料」走它 —— 只读 /api/fuel 拿到的是 300s 周期的内存快照，
+    上游出错时点多少次都不会变，必须真的拉一次上游。
+    """
+    if _MONITOR is not None and _MONITOR.enabled:
+        return _MONITOR.refresh()
+    return fail_snapshot("燃料监控未启动（缺 AK/SK，见 volc-fuel.json）")
 
 
 def stop_monitor():

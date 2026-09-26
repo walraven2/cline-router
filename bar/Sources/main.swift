@@ -275,7 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func refreshFuel() {
-        FuelMonitor.shared.fetch()
+        FuelMonitor.shared.refreshNow()
     }
 
     @objc func openFuelCred() {

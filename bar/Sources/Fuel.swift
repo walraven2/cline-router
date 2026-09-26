@@ -137,4 +137,28 @@ final class FuelMonitor {
             }
         }.resume()
     }
+
+    /// 真·立即刷新：让路由去拉一次上游，响应体就是刷新后的快照。
+    /// 只调 fetch() 读的是 300s 周期的内存快照 —— 上游出错时点多少次都不会变。
+    func refreshNow() {
+        let port = RouterConfig.load().port
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/fuel/refresh") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.addValue("1", forHTTPHeaderField: "X-Router-UI")
+        req.timeoutInterval = 20
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                // 硬刷新没成功（服务没起 / 超时）就退回收缓存，别让状态栏停在旧值
+                DispatchQueue.main.async { self?.fetch() }
+                return
+            }
+            let snap = FuelSnapshot(json: obj)
+            DispatchQueue.main.async {
+                self?.snapshot = snap
+                self?.onUpdate?()
+            }
+        }.resume()
+    }
 }
