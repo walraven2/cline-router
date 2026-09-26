@@ -2,7 +2,7 @@
   "host": "127.0.0.1",
   "port": 4000,
   "auth_key": "",
-  "default_model": "volc-deepseek41",
+  "default_model": "cb-hy3",
   "only_auto": true,
   "upstreams": {
     "volc": {
@@ -14,7 +14,17 @@
       "base_url": "https://api.cline.bot/api/v1",
       "unwrap_data": true,
       "api_key": "",
-      "timeout": 900
+      "timeout": 900,
+      "headers": {
+        "User-Agent": "Cline/4.1.21",
+        "X-IS-MULTIROOT": "false",
+        "X-CLIENT-TYPE": "cline-vscode",
+        "X-CLIENT-VERSION": "4.1.21",
+        "X-PLATFORM": "vscode",
+        "X-PLATFORM-VERSION": "4.1.21",
+        "X-CORE-VERSION": "4.1.21",
+        "X-Task-ID": "cline-router"
+      }
     },
     "codebuddy": {
       "base_url": "https://copilot.tencent.com",
@@ -78,6 +88,11 @@
       "id": "cline-free-mimo",
       "upstream": "cline",
       "model": "xiaomi/mimo-v2.6-flash"
+    },
+    {
+      "id": "cline-free-deepseek41",
+      "upstream": "cline",
+      "model": "cline-free/deepseek-v4.1-flash"
     },
     {
       "id": "volc-doubao-mini",

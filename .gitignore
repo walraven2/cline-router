@@ -1,6 +1,7 @@
 # ---------- 密钥 / 运行时配置（绝不入库）----------
 models.json
 models.json.bak
+models.json.bak_*
 volc-fuel.json
 *-cache.json
 *.log

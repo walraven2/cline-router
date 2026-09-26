@@ -279,11 +279,29 @@ CodeBuddy 官方服务**不是** OpenAI 兼容的，直接用通用 OpenAI 通�
 |---|---|
 | Base URL | `https://api.cline.bot/api/v1`，需 `unwrap_data: true` |
 | Key | app.cline.bot → Settings → API Keys 新建（`sk_...`） |
-| 模型 ID | `provider/model`，如 `deepseek/deepseek-v4.1-flash` |
+| 模型 ID | 付费通道：`provider/model`，如 `deepseek/deepseek-v4.1-flash`；免费通道：**`cline-free/<model>` 命名空间**，如 `cline-free/deepseek-v4.1-flash`（同模型、两条通道，别混） |
+| 🆓 免费通道 | `cline-free/deepseek-v4.1-flash`、`cline-free/mimo-v2.6-flash`、`cline-free/muse-spark-1.3-contributor`、`stealth/space-bunny-alpha`（客户端 FREE 分组）。**必须带 Cline 客户端标识头才放行**（否则 403 `only available via Cline product surfaces`）；实测多次调用后账号余额**纹丝不动**（$0.00359 不变）＝真 0 扣费 |
 | 模型清单接口 | **`GET /api/v1/models` 可用**（Bearer 认证），返回全量 458 个 ID，查模型名不用再靠猜 |
 | 混元系 | 清单里有 `tencent/hy3`、`tencent/hy3-preview`、`tencent/hy4-preview`、`tencent/hy-mt2-*`、`tencent/hunyuan-a13b-instruct`，但**全部要 Cline Credits**（无 `:free` 版），实测余额不足报 `insufficient_credits` → 想白用混元请走 CodeBuddy 侧 `cb-hy3` |
-| 计费 | **看响应里的 `usage.cost`**：为 0 才真免费；非 0 即按量计费（**Cline 客户端里的 FREE 档不适用于 API**，实测客户端 `$0.0000`、API 同模型 `$0.0006+`） |
-| 坑 | ① 扩展专属模型（如 `deepseek/deepseek-v4-flash`）用 API 调会 **403 `only available via Cline product surfaces`**；② 官方免费模型多为**推理型**，`max_tokens` 给小了会因"思考吃光 token、正文为空"返回 `500 empty response content`（≥1200 才稳，Cline 里建议 Max Output Tokens ≥8192）；③ 网关对**并发**敏感，同时打多路会出现 SSL reset（`URLError(SSLEOFError)`）；④ 免费档常 429/500（上游限流） |
+| 计费 | `usage.cost` 是**市场价展示**，≠ 实际扣费：`cline-free/*` 通道 cost 非 0 但余额不变；付费通道余额不足直接 **402 `insufficient_credits`**（响应体带 `current_balance`，可当余额探针用） |
+| 坑 | ① 不带客户端标识头时，`cline-free/*` 与扩展专属模型（如 `deepseek/deepseek-v4-flash`）用 API 调一律 **403 `only available via Cline product surfaces`**（补齐标识头即过，见下）；② 官方免费模型多为**推理型**，`max_tokens` 给小了会因"思考吃光 token、正文为空"返回 `500 empty response content`（≥1200 才稳，Cline 里建议 Max Output Tokens ≥8192）；③ 网关对**并发**敏感，同时打多路会出现 SSL reset（`URLError(SSLEOFError)`）；④ 免费档常 429/500（上游限流） |
+
+**产品通道标识头（2026-09-26 实测打通）**：Cline 服务端按**请求头**区分「自家产品界面」与「第三方 API」。在 `upstreams.cline.headers` 带上这组头，`cline-free/*` 免费模型即从 403 变为 200（值不严格校验，路由器用静态值即可；来源是扩展 `saoudrizwan.claude-dev` 的 `sep()` 函数）：
+
+```jsonc
+"headers": {
+  "User-Agent": "Cline/4.1.21",
+  "X-IS-MULTIROOT": "false",
+  "X-CLIENT-TYPE": "cline-vscode",
+  "X-CLIENT-VERSION": "4.1.21",
+  "X-PLATFORM": "vscode",
+  "X-PLATFORM-VERSION": "4.1.21",
+  "X-CORE-VERSION": "4.1.21",
+  "X-Task-ID": "cline-router"
+}
+```
+
+> 扩展升级后这些头若变化，用 `grep -o '"X-CLIENT-TYPE"' <扩展目录>/dist/extension.js` 找到 `sep()` 函数重新提取核对。客户端 FREE 分组的权威清单：`~/.cline/data/globalState.json`（`*ClineModelId` 字段）与 `<扩展>/dist/extension.js` 里的 `free:[...]`。
 
 ### 6.3 `upstreams.myapi`
 占位上游（`base_url` 是假地址，当前无模型引用它）。加新上游照抄这块结构即可。
@@ -307,12 +325,13 @@ CodeBuddy 官方服务**不是** OpenAI 兼容的，直接用通用 OpenAI 通�
 
 ## 7. 当前模型清单（2026-09-25 快照）
 
-**对话模型 29 个**（`bash cline-router.sh models` 可随时核对）：
+**对话模型 30 个**（`bash cline-router.sh models` 可随时核对）：
 
 | ID | 真实模型 | 计费 |
 |---|---|---|
 | `cline-free-bunny` | stealth/space-bunny-alpha | 🆓 cost=0 |
 | `cline-free-mimo` | xiaomi/mimo-v2.6-flash | 🆓 cost=0 |
+| `cline-free-deepseek41` | cline-free/deepseek-v4.1-flash | 🆓 真 0 扣费（产品通道标识头，见 §6.2） |
 | `cline-free-minimax` | minimax/minimax-m3 | 🆓 cost=0 |
 | `cline-free-nemotron` | nvidia/nemotron-3-super-120b-a12b:free | 🆓 cost=0 |
 | `cline-paid-deepseek41` | deepseek/deepseek-v4.1-flash | 💰 7.5e-05 |
@@ -446,3 +465,4 @@ bash bar/build.sh install && launchctl kickstart -k gui/$(id -u)/com.wangcheng.c
 | 2026-09-26 | **接入 CodeBuddy 官方接口**：新增 `codebuddy.py` 适配层与上游 `mode` 字段（openai/codebuddy）；支持多 Key 轮换、流式强制与 SSE→非流式本地聚合、上游 11102 错误中文化；加入实测可用的 8 个 `cb-*` 模型；面板上游卡片新增接口类型/对话路径/密钥池/轮换周期；`router.spec` 把新模块加进 hiddenimports |
 | 2026-09-25 | **健壮性打磨**（体检后修复）：`RouterHTTPServer` 重写 `handle_error`（RST/EPIPE 只记一行 `CLIENT-DROP`，消除日志 Traceback 噪音）；启动 bind 撞 `EADDRINUSE` 重试 3 次后清晰退出；自检补 `/api/fuel`、`/api/workbuddy` 用例并用临时 `--data-dir` 隔离缓存 |
 | 2026-09-26 | **菜单栏精简**：删除「模型（N）」子菜单（只用于点按复制模型 ID，与「默认模型」子菜单重复），同步删掉 `copyModelId` 动作；查模型清单改用 `bash cline-router.sh models` |
+| 2026-09-26 | **打通 Cline 产品通道免费模型（`cline-free/*`）**：实测服务端按**请求头**识别「Cline 产品界面」——`upstreams.cline` 补齐 8 个客户端标识头（`X-CLIENT-TYPE`/`X-PLATFORM`/`X-CORE-VERSION`/`X-TASK-ID` 等，提取自扩展 `sep()` 函数）后，`cline-free/deepseek-v4.1-flash` 由 403 变 200 且**余额零变化**（$0.00359 多次调用不变）；新增 `cline-free-deepseek41`（对话模型 29 → 30）。同款模型的既有免费通道：`cb-deepseek-v41-flash`（CodeBuddy 订阅）、`volc-deepseek41`（火山套餐） |
