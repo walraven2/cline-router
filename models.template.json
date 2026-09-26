@@ -16,6 +16,15 @@
       "api_key": "",
       "timeout": 900
     },
+    "codebuddy": {
+      "base_url": "https://copilot.tencent.com",
+      "mode": "codebuddy",
+      "path": "/v2/chat/completions",
+      "api_key": "",
+      "api_keys": [],
+      "rotation_count": 10,
+      "timeout": 900
+    },
     "myapi": {
       "base_url": "https://改成你自己的网关地址/v1",
       "api_key": "",
@@ -99,6 +108,76 @@
       "id": "volc-kimi-k3",
       "upstream": "volc",
       "model": "kimi-k3"
+    },
+    {
+      "id": "cb-glm-51",
+      "upstream": "codebuddy",
+      "model": "glm-5.1"
+    },
+    {
+      "id": "cb-glm-50",
+      "upstream": "codebuddy",
+      "model": "glm-5.0"
+    },
+    {
+      "id": "cb-glm-50-turbo",
+      "upstream": "codebuddy",
+      "model": "glm-5.0-turbo"
+    },
+    {
+      "id": "cb-glm-5v-turbo",
+      "upstream": "codebuddy",
+      "model": "glm-5v-turbo"
+    },
+    {
+      "id": "cb-deepseek-v3",
+      "upstream": "codebuddy",
+      "model": "deepseek-v3"
+    },
+    {
+      "id": "cb-deepseek-v32",
+      "upstream": "codebuddy",
+      "model": "deepseek-v3.2"
+    },
+    {
+      "id": "cb-deepseek-r1",
+      "upstream": "codebuddy",
+      "model": "deepseek-r1"
+    },
+    {
+      "id": "cb-deepseek-v41-flash",
+      "upstream": "codebuddy",
+      "model": "deepseek-v4.1-flash"
+    },
+    {
+      "id": "cb-deepseek-v4-flash",
+      "upstream": "codebuddy",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "id": "cb-deepseek-v4-pro",
+      "upstream": "codebuddy",
+      "model": "deepseek-v4-pro"
+    },
+    {
+      "id": "cb-hy3",
+      "upstream": "codebuddy",
+      "model": "hy3"
+    },
+    {
+      "id": "cb-hy3-preview",
+      "upstream": "codebuddy",
+      "model": "hy3-preview"
+    },
+    {
+      "id": "cb-hy4-preview",
+      "upstream": "codebuddy",
+      "model": "hy4-preview"
+    },
+    {
+      "id": "cb-kimi-k25",
+      "upstream": "codebuddy",
+      "model": "kimi-k2.5"
     }
   ],
   "images": [

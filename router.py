@@ -55,6 +55,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import admin_ui
+import codebuddy
 import volc_fuel
 import workbuddy_credits
 
@@ -155,9 +156,21 @@ class Config:
 
         self.upstreams = {}
         for name, up in (raw.get("upstreams") or {}).items():
+            mode = (up.get("mode") or "openai").strip().lower()
+            if mode not in ("openai", codebuddy.MODE):
+                raise ValueError("上游 %s 的 mode 只能是 openai 或 %s" % (name, codebuddy.MODE))
+            # mode=codebuddy 的上游默认落在/v2/chat/completions，见 codebuddy.chat_path
+            path = (up.get("path") or "").strip()
+            keys = [_expand(item) for item in (up.get("api_keys") or [])]
             self.upstreams[name] = {
+                "name": name,
+                "mode": mode,
+                "path": path,
                 "base_url": (up.get("base_url") or "").rstrip("/"),
                 "api_key": _expand(up.get("api_key", "") or ""),
+                # 多密钥轮换（CodeBuddy 这类按账号限流的厂子和对流很有用）
+                "api_keys": [_expand(k) for k in keys if isinstance(k, str) and k.strip()],
+                "rotation_count": int(up.get("rotation_count", 1) or 1),
                 "proxy": _expand(up.get("proxy", "") or ""),
                 "timeout": int(up.get("timeout", 900)),
                 "user_agent": up.get("user_agent") or "",  # 留空=透传客户端 UA，行为与直连一致
@@ -221,10 +234,15 @@ def validate_config(raw):
     if not isinstance(upstreams, dict):
         return errors + ["upstreams 必须是对象"]
     for name, up in upstreams.items():
-        if not (up or {}).get("base_url"):
+        up = up or {}
+        if not up.get("base_url"):
             errors.append("上游 %s 缺少 Base URL" % name)
-        if (up or {}).get("headers") is not None and not isinstance(up.get("headers"), dict):
+        if up.get("headers") is not None and not isinstance(up.get("headers"), dict):
             errors.append("上游 %s 的额外请求头必须是 JSON 对象" % name)
+        if up.get("mode") and str(up["mode"]).strip().lower() not in ("openai", codebuddy.MODE):
+            errors.append("上游 %s 的 mode 只能是 openai 或 %s" % (name, codebuddy.MODE))
+        if up.get("api_keys") is not None and not isinstance(up.get("api_keys"), list):
+            errors.append("上游 %s 的密钥池必须是数组（一行一把 Key）" % name)
 
     seen = set()
     for item in raw.get("models") or []:
@@ -258,6 +276,11 @@ def validate_config(raw):
             errors.append("图片模型 %s 缺少上游真实模型名" % iid)
         if item.get("upstream") not in upstreams:
             errors.append("图片模型 %s 引用了不存在的上游 %r" % (iid, item.get("upstream")))
+        image_up = upstreams.get(item.get("upstream")) or {}
+        if str(image_up.get("mode") or "openai").strip().lower() == codebuddy.MODE:
+            # 适配器只处理对话协议，挂上去会静默失败，所以在保存时拦住
+            errors.append("图片模型 %s 不能挂在 %s 上游（CodeBuddy 适配层只做对话）"
+                          % (iid, item.get("upstream")))
     return errors
 
 
@@ -312,11 +335,12 @@ def build_opener(up):
     )
 
 
-def upstream_call(up, payload, timeout=None, path="/chat/completions"):
-    """向上游发一次普通（非流式）请求，返回 (status, text)。"""
+def upstream_call(up, payload, timeout=None, path=None):
+    """向上游发一次普通（非流式）请求，返回 (status, text)。path 缺省用上游的对话路径。"""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        up["base_url"] + path, data=body, headers=build_headers(up), method="POST"
+        up["base_url"] + (path or up["path"] or "/chat/completions"),
+        data=body, headers=build_headers(up), method="POST"
     )
     try:
         resp = build_opener(up).open(req, timeout=timeout or up["timeout"])
@@ -450,12 +474,23 @@ class Router(BaseHTTPRequestHandler):
             return self._send_json(404, {"error": {"message": "未知模型 %r（改完配置请先保存再测）" % mid}})
         up = self.config.upstreams[entry["upstream"]]
         started = time.time()
-        status, text = upstream_call(up, {
+        probe = {
             "model": entry["model"],
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 8,
-            "stream": False,
-        }, timeout=min(up["timeout"], 60))
+        }
+        if up["mode"] == codebuddy.MODE:
+            # CodeBuddy 只出流式，这里强制走适配层，把 SSE 聚合成 JSON 再判定，与真实调用同一路径
+            status, resp, err = self._cb_open(up, probe, timeout=min(up["timeout"], 60))
+            if status == 0:
+                text = "连接上游失败: " + err[:300]
+            elif resp is None:
+                text = json.dumps(codebuddy.translate_error(status, err), ensure_ascii=False)
+            else:
+                text = json.dumps(codebuddy.aggregate_stream(resp, entry["model"]), ensure_ascii=False)
+        else:
+            probe["stream"] = False
+            status, text = upstream_call(up, probe, timeout=min(up["timeout"], 60))
         ok = status == 200 and '"choices"' in text
         detail = text if len(text) <= 300 else text[:300] + "…"
         return self._send_json(200, {
@@ -614,6 +649,54 @@ class Router(BaseHTTPRequestHandler):
             mid, entry["model"], entry["upstream"], status,
             time.time() - started, len(raw), "（信封已拆）" if len(body) != len(text) else ""))
 
+    # ---------------- CodeBuddy 官方协议（详见 codebuddy.py） ----------------
+    def _cb_open(self, up, payload, timeout=None):
+        """向 CodeBuddy 上游发一次请求。
+
+        返回 (status, resp, error_text)：
+          status=0  连接层失败（error_text 是异常/原因）
+          resp=None 上游返回非 2xx（error_text 是上游响应体）
+          其余      resp 是流对象，**调用方负责关闭**
+        """
+        body = json.dumps(codebuddy.prepare_payload(payload), ensure_ascii=False).encode("utf-8")
+        api_key = codebuddy.next_api_key(up)
+        if not api_key:
+            return 0, None, "上游 %s 没配密钥（填 api_key 或 api_keys）" % up.get("name", "?")
+        headers = codebuddy.build_headers(up, api_key, self.headers.get("User-Agent"))
+        url = up["base_url"] + codebuddy.chat_path(up)
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            return 200, build_opener(up).open(req, timeout=timeout or up["timeout"]), ""
+        except urllib.error.HTTPError as exc:
+            return exc.code, None, exc.read(4000).decode("utf-8", "replace")
+        except Exception as exc:
+            return 0, None, repr(exc)
+
+    def _handle_codebuddy(self, up, payload, mid, entry):
+        """CodeBuddy 上游的对话处理：客户端要流式就透传 SSE，要非流式就在本地聚合。"""
+        started = time.time()
+        status, resp, err = self._cb_open(up, payload)
+        upstream_name = up.get("name", "?")
+        if status == 0:
+            log("FAIL %s -> %s [%s] 连接上游失败: %s" % (mid, entry["model"], upstream_name, err[:200]))
+            return self._send_json(502, {"error": {"message": "连接上游失败: %s" % err[:300]}})
+        if resp is None:
+            log("FAIL %s -> %s [%s] 上游 HTTP %s: %s" % (mid, entry["model"], upstream_name, status, err[:200]))
+            return self._send_json(status, codebuddy.translate_error(status, err))
+        if payload.get("stream"):
+            return self._relay(resp, mid, entry, started)   # 上游本来就是标准 OpenAI SSE，直接透传
+
+        obj = codebuddy.aggregate_stream(resp, entry["model"])
+        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        code = 200 if "error" not in obj else 502
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+        log("OK %s -> %s [%s] %s %.1fs %dB（流式已聚合）" % (
+            mid, entry["model"], upstream_name, code, time.time() - started, len(raw)))
+
     # ---------------- UI 与只读端点 ----------------
     def _fuel_payload(self):
         """火山方舟 Agent Plan 燃料余额（读常驻刷新器的内存快照，不阻塞）"""
@@ -721,13 +804,18 @@ class Router(BaseHTTPRequestHandler):
         up = self.config.upstreams[entry["upstream"]]
         payload["model"] = entry["model"]  # 把本地别名换成上游真实模型名
 
+        # CodeBuddy 官方协议不走标准 OpenAI 通道：要专用请求头、强制流式，非流式需本地聚合
+        if up["mode"] == codebuddy.MODE:
+            return self._handle_codebuddy(up, payload, mid, entry)
+
         # 非流式 + 该上游开了 unwrap_data：走缓冲区模式，拆掉 {"data": ...} 信封
         if up["unwrap_data"] and not payload.get("stream"):
             return self._relay_json_unwrapped(up, payload, mid, entry)
 
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = build_headers(up, self.headers.get("User-Agent"))
-        req = urllib.request.Request(up["base_url"] + "/chat/completions", data=body, headers=headers, method="POST")
+        req = urllib.request.Request(up["base_url"] + (up["path"] or "/chat/completions"),
+                                     data=body, headers=headers, method="POST")
 
         started = time.time()
         try:

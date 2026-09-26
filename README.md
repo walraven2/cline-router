@@ -28,6 +28,7 @@ Cline（Model ID = auto）──> http://127.0.0.1:4000/v1 ──┬──> http
 | 路径 | 职责 |
 |---|---|
 | `router.py` | **核心**。HTTP 服务：配置加载 / 路由 / 流式透传 / 图像生成 / 配置面板接口 / 热加载 |
+| `codebuddy.py` | CodeBuddy 官方协议的适配层（专用请求头 / 强制流式 / SSE→非流式聚合 / 多 Key 轮换） |
 | `admin_ui.py` | 配置面板的 HTML+CSS+JS（纯字符串常量，无模板引擎） |
 | `volc_fuel.py` | 火山方舟 Agent Plan「燃料」余额查询（AK/SK 签名）+ daemon 定时刷新 + 缓存 |
 | `workbuddy_credits.py` | WorkBuddy / CodeBuddy「积分」查询（令牌发现 + 签到）+ daemon 定时刷新 + 缓存 |
@@ -137,8 +138,12 @@ bash ~/Cline 路由/make_template.sh   # 从 models.json 生成脱敏模板，�
 
   "upstreams": {
     "<上游名>": {
+      "mode": "openai",                 // "openai"（默认，标准兼容网关）| "codebuddy"（官方协议，见 §5.10）
       "base_url": "https://...",        // 必填，末尾不带 /
+      "path": "/chat/completions",      // 对话端点路径；留空按 mode 取默认（codebuddy→/v2/chat/completions）
       "api_key": "sk-...",              // 上游密钥；支持 "${ENV_VAR}" 从环境变量读
+      "api_keys": [],                   // 密钥池，一行一把；有值则与 api_key 一起参与轮换（见 §5.10）
+      "rotation_count": 1,              // 每 N 次请求换下一把 Key（单 Key 时无意义）
       "timeout": 900,                   // 秒
       "proxy": "",                      // 可选，如 http://127.0.0.1:7890；留空=不走代理
       "user_agent": "",                 // 可选，留空=透传客户端 UA（行为与直连一致）
@@ -232,7 +237,15 @@ Cline 官方 API（`api.cline.bot`）的**非流式**响应是 `{"data": {...cho
 - `/api/workbuddy`：查 WorkBuddy / CodeBuddy 积分。令牌发现顺序：`~/.workbuddy-status/config.json` 的 `accessToken` > 环境变量 `WORKBUDDY_ACCESS_TOKEN` > 桌面端登录目录（`~/.workbuddy/auth`、`~/.codebuddy/auth`）。与 WorkBuddyStatus 小工具共享 `~/.workbuddy-status/` 的令牌指纹偏好与签到标记。
 - 无凭据时端点仍返回 **200 + `ok:false`**（附原因文案）而非报错——自检对这两条端点有断言（只要求 200 + 结构正确）。
 
-### 5.9 连接健壮性（启动与断连）
+### 5.9 `mode: "codebuddy"`：CodeBuddy 官方协议
+CodeBuddy 官方服务**不是** OpenAI 兼容的，直接用通用 OpenAI 通道打会失败。`mode: "codebuddy"` 的上游走 `codebuddy.py` 适配层，做四件事：
+1. **专用请求头**：`Authorization` + `X-API-Key` 双写密钥，并带上 `X-Conversation-ID`/`X-Request-ID`/`X-IDE-Type`/`x-stainless-*` 等一堆必带头；会话类 ID **每次请求现生成**（模拟 CLI 的独立会话，避免被按会话聚合限流）。
+2. **强制流式**：上游只认 `stream: true`。客户端要流式 → 直接透传 SSE；客户端要非流式 → 在本层把 SSE 聚合成标准 `chat.completion` 对象（含 content / tool_calls 分片合并 / usage / finish_reason）后再返回。
+3. **消息数兜底**：只有 1 条 user 消息时上游会拒，自动补一条最简 system。
+4. **多 Key 轮换**：`api_key` + `api_keys[]` 组成密钥池，每 `rotation_count` 次请求换下一把；轮换计数按上游名存内存，**配置热加载不丢**（只有一把 Key 时零开销直接用）。
+错误翻译：上游的 `{"code":11102,"msg":...}` 会被转成 OpenAI 形态的 `{"error":{"message":...,"code":...}}`，并把 `displayTips` 里的中文提示拼上去，Cline 里能直接看懂。
+
+### 5.10 连接健壮性（启动与断连）
 - 客户端在读请求行前/写响应中途断开（Cline 取消请求、健康探针提前关闭）由 `RouterHTTPServer.handle_error` 降噪：只记一行 `CLIENT-DROP`，不再打整段 Traceback。
 - 启动 bind 撞 `EADDRINUSE`（.app 的 launchd KeepAlive 与手动启动抢端口）时**重试 3 次 × 1.5s**（每次重建 server 对象），仍失败则打印占用提示（含 `lsof` 命令）后退出。
 
@@ -256,17 +269,34 @@ Cline 官方 API（`api.cline.bot`）的**非流式**响应是 `{"data": {...cho
 | Base URL | `https://api.cline.bot/api/v1`，需 `unwrap_data: true` |
 | Key | app.cline.bot → Settings → API Keys 新建（`sk_...`） |
 | 模型 ID | `provider/model`，如 `deepseek/deepseek-v4.1-flash` |
+| 模型清单接口 | **`GET /api/v1/models` 可用**（Bearer 认证），返回全量 458 个 ID，查模型名不用再靠猜 |
+| 混元系 | 清单里有 `tencent/hy3`、`tencent/hy3-preview`、`tencent/hy4-preview`、`tencent/hy-mt2-*`、`tencent/hunyuan-a13b-instruct`，但**全部要 Cline Credits**（无 `:free` 版），实测余额不足报 `insufficient_credits` → 想白用混元请走 CodeBuddy 侧 `cb-hy3` |
 | 计费 | **看响应里的 `usage.cost`**：为 0 才真免费；非 0 即按量计费（**Cline 客户端里的 FREE 档不适用于 API**，实测客户端 `$0.0000`、API 同模型 `$0.0006+`） |
 | 坑 | ① 扩展专属模型（如 `deepseek/deepseek-v4-flash`）用 API 调会 **403 `only available via Cline product surfaces`**；② 官方免费模型多为**推理型**，`max_tokens` 给小了会因"思考吃光 token、正文为空"返回 `500 empty response content`（≥1200 才稳，Cline 里建议 Max Output Tokens ≥8192）；③ 网关对**并发**敏感，同时打多路会出现 SSL reset（`URLError(SSLEOFError)`）；④ 免费档常 429/500（上游限流） |
 
 ### 6.3 `upstreams.myapi`
 占位上游（`base_url` 是假地址，当前无模型引用它）。加新上游照抄这块结构即可。
 
+### 6.4 CodeBuddy 官方接口（`upstreams.codebuddy`，`mode: "codebuddy"`）
+| 项 | 值 |
+|---|---|
+| Base URL | `https://copilot.tencent.com`（国内版）；海外版是 `https://www.codebuddy.ai`（同一把国内 Key 打海外端点是 401） |
+| 路径 | `/v2/chat/completions`（**非标准**，由 codebuddy 适配层自动拼） |
+| Key | 控制台生成的 `ck_...`；请求时需 `Authorization: Bearer` 与 `X-API-Key` 同时给（适配层已处理） |
+| 可用模型 ID | 实测通过：`glm-5.1`、`glm-5.0`、`glm-5.0-turbo`、`glm-5v-turbo`、`deepseek-v3`、`deepseek-v3.2`、`deepseek-r1`、`kimi-k2.5`、`deepseek-v4.1-flash`、`deepseek-v4-flash`、`deepseek-v4-pro`、**`hy3`**、**`hy3-preview`**、**`hy4-preview`** |
+| 实测不可用 | `claude-*`、`gpt-5*`、`gemini-2.5-*`、`o4-mini`、`glm-4.6/4.5`、`deepseek-v4`（裸版本号无此模型）、`deepseek-v4-turbo`、`deepseek-v4.1`、`deepseek-v4.1-pro`、`qwen3-*`、`hunyuan-3/4`、`hunyuan-t1`、`hunyuan-turbos-latest`、**`hy4`**（裸 ID 无）、**`hy3-turbo`/`hy3-pro`/`hy4-flash`/`hy4-turbo`/`hy4-pro`/`hy4-lite`/`hy4-air`** → `11102 service info not found`；`gemini-2.5-pro`、`gpt-5.1` → `only available for authorized users`（没开白名单） |
+| 命名坑 | ① deepseek 系 ID **必须带 flash/pro 后缀**（`deepseek-v4.1-flash` ✓，`deepseek-v4.1` ✗）；② 混元系在 CodeBuddy 里叫**短名 `hyN`**，不叫 hunyuan（`hy3` ✓、`hunyuan-3` ✗），且 hy4 **只有 preview 版**（裸 `hy4` 不存在） |
+| 计费差异 | 响应体 `usage.credit` 字段可判收费：`hy3` / `hy3-preview` / 全部 cb 系 = **0（含在订阅内，不额外扣分）**；**`hy4-preview` = 0.03~0.07/次（按量扣积分）**，与其它 cb 模型不同，注意别当免费模型跑批量 |
+| 计费 | 走 CodeBuddy 账号额度/订阅，**不另按 API 次收费** |
+| 坑 | ① **只支持流式**（`stream: false` 会失败，适配层强制 true 再本地聚合）；② `messages` 只有 1 条 user 时会被拒 → 自动补 system；③ 没有 `/v1/models` 列表接口（GET 返回 404），模型 ID 只能靠试；④ 模型不存在时 HTTP **400**（不是 404），错误体是 `{code, msg, displayMsg, displayTips}` 结构 |
+
+> 模型 ID 没有清单接口，上述清单是逐个实测得到的。想扩 model 时按 6.4 的命名加一行再点面板「测试」即可（不可用会得到中文化的 11102 提示）。
+
 ---
 
 ## 7. 当前模型清单（2026-09-25 快照）
 
-**对话模型 15 个**（`bash cline-router.sh models` 可随时核对）：
+**对话模型 29 个**（`bash cline-router.sh models` 可随时核对）：
 
 | ID | 真实模型 | 计费 |
 |---|---|---|
@@ -285,10 +315,24 @@ Cline 官方 API（`api.cline.bot`）的**非流式**响应是 `{"data": {...cho
 | `volc-kimi-k28` | kimi-k2.8-preview | 📦 |
 | `volc-kimi-k3` | kimi-k3 | 📦 |
 | `volc-minimax` | minimax-m3 | 📦 |
+| `cb-glm-51` | glm-5.1 | 🧊 CodeBuddy 额度 |
+| `cb-glm-50` | glm-5.0 | 🧊 |
+| `cb-glm-50-turbo` | glm-5.0-turbo | 🧊 |
+| `cb-glm-5v-turbo` | glm-5v-turbo | 🧊 |
+| `cb-deepseek-v3` | deepseek-v3 | 🧊 |
+| `cb-deepseek-v32` | deepseek-v3.2 | 🧊 |
+| `cb-deepseek-r1` | deepseek-r1 | 🧊 |
+| `cb-kimi-k25` | kimi-k2.5 | 🧊 |
+| `cb-deepseek-v41-flash` | deepseek-v4.1-flash | 🧊（与 `volc-deepseek41` 同模型、不同额度） |
+| `cb-deepseek-v4-flash` | deepseek-v4-flash | 🧊 |
+| `cb-deepseek-v4-pro` | deepseek-v4-pro | 🧊 |
+| `cb-hy3` | hy3（腾讯混元 3） | 🆓 credit=0（cb 系里唯一确认不扣分的混元） |
+| `cb-hy3-preview` | hy3-preview | 🆓 credit=0 |
+| `cb-hy4-preview` | hy4-preview（hy4 只有 preview 版） | 💰 credit≈0.03~0.07/次 |
 
 **图片模型 2 个**：`seedream-pro`（1024×1024）、`seedream-lite`（2048×2048）。
 
-> 命名约定：`cline-free-*` 随便用；`cline-paid-*` 用之前知道在花钱；`volc-*` 走已付费套餐（**推荐主力**，同一模型优先用 volc 版，例如 `volc-deepseek41` 对 `cline-paid-deepseek41`）。
+> 命名约定：`cline-free-*` 随便用；`cline-paid-*` 用之前知道在花钱；`volc-*` 走已付费套餐（**推荐主力**，同一模型优先用 volc 版，例如 `volc-deepseek41` 对 `cline-paid-deepseek41`）；`cb-*` 走 CodeBuddy 账号额度，不另按次收费。
 
 ---
 
@@ -298,7 +342,7 @@ Cline 官方 API（`api.cline.bot`）的**非流式**响应是 `{"data": {...cho
 cd ~/Cline 路由
 
 # 1) 语法检查（Py 文件）
-python3 -c "import py_compile; py_compile.compile('router.py', doraise=True); py_compile.compile('admin_ui.py', doraise=True); print('语法 OK')"
+python3 -c "import py_compile; [py_compile.compile(f, doraise=True) for f in ('router.py','admin_ui.py','codebuddy.py')]; print('语法 OK')"
 
 # 2) 配置 JSON 合法性
 python3 -c "import json; json.load(open('models.json')); print('JSON OK')"
@@ -380,4 +424,7 @@ bash bar/build.sh install && launchctl kickstart -k gui/$(id -u)/com.wangcheng.c
 | 2026-09-25 | **auto 模式**：新增保留名 `auto`（路由到 `default_model`）、`only_auto` 开关（/v1/models 只暴露 auto）、`POST /api/default` 端点；面板加「默认模型」下拉与开关；菜单栏 App 加「默认模型」切换子菜单。Cline 里从此固定只填 auto |
 | 2026-09-25 | **打包成可分发的 .app / DMG**：`router.py` 增 `--data-dir`（数据目录可外置）；pyinstaller 把路由器冻成单文件二进制，与 Swift 菜单栏 App 一起打进 `Cline 路由.app`；首次启动自动迁移旧配置到 `~/Library/Application Support/ClineRouter/`；开机自启 plist 改为指向 .app 内二进制并整份重写；新增 `make_dmg.sh`（打 DMG + 挂载自检）。实测：从 `/tmp` 启动 .app → launchd 拉起内置冻结二进制 → 接管 4000 → 真实请求返回正文 ✓ |
 | 2026-09-25 | **菜单栏燃料 / 积分监控**：新增 `volc_fuel.py`（Agent Plan 燃料，AK/SK 签名）与 `workbuddy_credits.py`（积分 + 签到）；新增 `/api/fuel`、`/api/workbuddy`、`/api/workbuddy/refresh`、`/api/workbuddy/checkin` 四个端点；菜单栏新增「燃料」「积分」两行；配置面板删除上游时同步统计图片模型引用 |
+| 2026-09-26 | **补入腾讯混元 hy 系**：实测 CodeBuddy 上 `hy3` / `hy3-preview` / `hy4-preview` 可用（裸 `hy4` 不存在，混元在 CodeBuddy 里叫 `hyN` 不叫 hunyuan），新增 `cb-hy3` / `cb-hy3-preview` / `cb-hy4-preview`；响应 `usage.credit` 判明 hy3 系不扣分、hy4-preview 按量扣分（0.03~0.07/次）。对话模型 26 → 29。另发现 Cline 侧 `GET /api/v1/models` 可拉全量清单，其中 `tencent/hy*` 全需 Cline Credits |
+| 2026-09-26 | **补入 deepseek v4 系**：实测确认 CodeBuddy 有 `deepseek-v4.1-flash` / `deepseek-v4-flash` / `deepseek-v4-pro`（裸 `deepseek-v4.1`、`deepseek-v4-turbo` 均为 11102），新增 `cb-deepseek-v41-flash` / `cb-deepseek-v4-flash` / `cb-deepseek-v4-pro`，对话模型 23 → 26 |
+| 2026-09-26 | **接入 CodeBuddy 官方接口**：新增 `codebuddy.py` 适配层与上游 `mode` 字段（openai/codebuddy）；支持多 Key 轮换、流式强制与 SSE→非流式本地聚合、上游 11102 错误中文化；加入实测可用的 8 个 `cb-*` 模型；面板上游卡片新增接口类型/对话路径/密钥池/轮换周期；`router.spec` 把新模块加进 hiddenimports |
 | 2026-09-25 | **健壮性打磨**（体检后修复）：`RouterHTTPServer` 重写 `handle_error`（RST/EPIPE 只记一行 `CLIENT-DROP`，消除日志 Traceback 噪音）；启动 bind 撞 `EADDRINUSE` 重试 3 次后清晰退出；自检补 `/api/fuel`、`/api/workbuddy` 用例并用临时 `--data-dir` 隔离缓存 |
