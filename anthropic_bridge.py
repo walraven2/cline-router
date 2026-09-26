@@ -281,8 +281,19 @@ class StreamTranslator(object):
         self.out_tokens = 0
         self.text_len = 0
         self.tool_calls = 0
+        self.finish = None
 
     def begin(self):
+        """只记状态，先不写字节。
+
+        message_start 推迟到第一个真实 token 到达时才发：上游在预算太小时会返回
+        一个「200 但零正文」的空流，若提前把 message_start 写出去，就没法中途改主意
+        （HTTP 头已发、事件序号已定），只能把空回复原样交给客户端。推迟后空流 =
+        一个字节都没写过，可以直接抬 token 重打一次。
+        """
+        self.started = False
+
+    def _open_text(self):
         self.write(_sse("message_start", {
             "type": "message_start",
             "message": {
@@ -303,12 +314,15 @@ class StreamTranslator(object):
             "content_block": {"type": "text", "text": ""},
         }))
         self.open_index.add(0)
+        self.started = True
 
     def feed(self, chunk):
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta") or {}
         text = delta.get("content")
         if text:
+            if not self.started:
+                self._open_text()
             self.text_len += len(text)
             self.write(_sse("content_block_delta", {
                 "type": "content_block_delta",
@@ -318,6 +332,8 @@ class StreamTranslator(object):
         for call in delta.get("tool_calls") or []:
             idx = call.get("index", 0)
             if idx not in self.tool_index:
+                if not self.started:
+                    self._open_text()
                 self.tool_calls += 1
                 bidx = self.next_index
                 self.next_index += 1
@@ -346,9 +362,14 @@ class StreamTranslator(object):
         usage = chunk.get("usage") or {}
         if usage.get("completion_tokens"):
             self.out_tokens = usage["completion_tokens"]
-        return choice.get("finish_reason")
+        if choice.get("finish_reason"):
+            self.finish = choice["finish_reason"]
+        return self.finish
 
     def end(self, finish_reason):
+        # 全程没来过任何内容（上游空流）→ 补一个空的合法响应，至少不用空回复交差
+        if not self.started:
+            self._open_text()
         for idx in sorted(self.open_index):
             self.write(_sse("content_block_stop", {"type": "content_block_stop", "index": idx}))
         self.write(_sse("message_delta", {
@@ -379,6 +400,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _sse_lines(self, resp):
+        """把上游 SSE 拆成 json chunk；非 JSON 的心跳行直接跳过。"""
+        for line in resp:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", "ignore")
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                yield json.loads(data)
+            except Exception:
+                continue
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -482,7 +519,7 @@ class Handler(BaseHTTPRequestHandler):
                                                                     "message": "upstream unreachable: %s" % detail.decode("utf-8", "ignore")}})
 
         if stream:
-            return self._relay_stream(resp, model)
+            return self._relay_stream(resp, model, payload)
         try:
             raw = resp.read()
             data = json.loads(raw.decode("utf-8", "ignore"))
@@ -491,7 +528,7 @@ class Handler(BaseHTTPRequestHandler):
                                                                     "message": "bad upstream json: %s" % exc}})
         return self._send_json(200, to_anthropic(data, model))
 
-    def _relay_stream(self, resp, model):
+    def _relay_stream(self, resp, model, payload):
         # 必须走 chunked：SSE 响应没有 Content-Length，客户端（Claude Code 的
         # Anthropic SDK）是靠「chunked 终止块 0\r\n\r\n」或「连接关闭」来判断
         # 流结束的。之前裸写 body 且声明 Connection: keep-alive，客户端收完
@@ -504,43 +541,40 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
-        tr = StreamTranslator(self._write_chunk, model)
-        tr.begin()
-        finish = None
-        try:
-            for line in resp:
-                if isinstance(line, bytes):
-                    line = line.decode("utf-8", "ignore")
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
+        resp_cur = resp
+        for attempt in (0, 1):
+            tr = StreamTranslator(self._write_chunk, model)
+            tr.begin()
+            try:
+                for chunk in self._sse_lines(resp_cur):
+                    tr.feed(chunk)
+            except Exception as exc:
+                log("STREAM ERR %r" % exc)
+            finally:
                 try:
-                    chunk = json.loads(data)
+                    resp_cur.close()
                 except Exception:
-                    continue
-                fr = tr.feed(chunk)
-                if fr:
-                    finish = fr
-        except Exception as exc:
-            log("STREAM ERR %r" % exc)
-        finally:
-            try:
-                tr.end(finish)
-            except Exception:
-                pass
-            # 终止块：明确告诉客户端 body 到此为止，随后关闭连接。
-            self._end_chunks()
-            try:
-                resp.close()
-            except Exception:
-                pass
-            stop = FINISH_MAP.get(finish, "end_turn")
-            empty = " 空正文!" if (stop == "max_tokens" and not tr.text_len and not tr.tool_calls) else ""
-            log("STREAM DONE model=%s stop=%s text=%d tools=%d%s"
-                % (model, stop, tr.text_len, tr.tool_calls, empty))
+                    pass
+            # 空流（零正文零工具调用）时，上游既没报错也没内容——多半是预算被隐藏
+            # 推理吃光。此时 message_start 还没发出去，可以抬 token 干净重打一次。
+            if tr.text_len or tr.tool_calls or not _escalate_max_tokens(payload):
+                break
+            log("空流重试：max_tokens 已抬至 %d" % payload["max_tokens"])
+            resp_cur, err = self._call_upstream(payload, True)
+            if err is not None:
+                log("空流重试失败：%s" % (err[1][:200],))
+                break
+
+        try:
+            tr.end(tr.finish)
+        except Exception:
+            pass
+        # 终止块：明确告诉客户端 body 到此为止，随后关闭连接。
+        self._end_chunks()
+        stop = FINISH_MAP.get(tr.finish, "end_turn")
+        empty = " 空正文!" if (not tr.text_len and not tr.tool_calls) else ""
+        log("STREAM DONE model=%s stop=%s text=%d tools=%d%s"
+            % (model, stop, tr.text_len, tr.tool_calls, empty))
 
     def _write_chunk(self, data):
         """chunked 编码写一个 SSE 事件块（长度十六进制 + CRLF 包裹）。"""

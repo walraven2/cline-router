@@ -45,9 +45,9 @@
   },
   "models": [
     {
-      "id": "cline-free-minimax",
+      "id": "cline-free-ling-sante",
       "upstream": "cline",
-      "model": "minimax/minimax-m3"
+      "model": "inclusionai/ling-3.0-flash-sante:free"
     },
     {
       "id": "cline-free-nemotron",
@@ -75,9 +75,9 @@
       "model": "nvidia/nemotron-3.5-lightning:free"
     },
     {
-      "id": "cline-free-nexpro",
+      "id": "cline-free-nemotron-nano",
       "upstream": "cline",
-      "model": "nex-agi/nex-n2.5-pro:free"
+      "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
     },
     {
       "id": "cline-free-bunny",
@@ -87,7 +87,7 @@
     {
       "id": "cline-free-mimo",
       "upstream": "cline",
-      "model": "xiaomi/mimo-v2.6-flash"
+      "model": "cline-free/mimo-v2.6-flash"
     },
     {
       "id": "cline-free-deepseek41",

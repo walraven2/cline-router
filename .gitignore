@@ -1,10 +1,12 @@
 # ---------- 密钥 / 运行时配置（绝不入库）----------
 models.json
-models.json.bak
-models.json.bak_*
 volc-fuel.json
 *-cache.json
 *.log
+
+# ---------- 配置快照（*.bak、*.bak_时间戳，任何 models*.json 都不入库）----------
+*.bak
+*.bak_*
 
 # ---------- 构建产物 ----------
 build/
@@ -21,7 +23,3 @@ images/*
 
 # ---------- macOS ----------
 .DS_Store
-
-# ---------- 二进制备份（源码备份 *.swift/*.py 仍入库）----------
-bar/backups/ClineRouterBar.[0-9]*
-bar/backups/router.[0-9]*
