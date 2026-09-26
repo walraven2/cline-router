@@ -683,8 +683,6 @@ def render_text(payload):
 class CreditsMonitor(object):
     """后台刷新线程：与 FuelMonitor 同款接口，供 router 内嵌使用。"""
 
-    enabled = True  # 凭据自动发现：始终尝试（缺失时快照带 error 提示）
-
     def __init__(self, interval=300):
         self.interval = max(60, int(interval))
         self.source = "未发现令牌"

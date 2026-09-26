@@ -7,11 +7,9 @@ import Foundation
 // 登录令牌由路由自动发现（~/.workbuddy-status/config.json 或桌面端 auth/*.info）。
 
 struct CreditPackage {
-    let code: String
     let name: String
     let total: Double
     let remain: Double
-    let used: Double
 
     /// "1,044.58 / 7,500"
     var detail: String { "\(fuelNum(remain)) / \(fuelNum(total))" }
@@ -22,7 +20,6 @@ struct WorkbuddyCheckin {
     let streak: Int
     let week: Int
     let daily: Double
-    let activity: String
 
     /// "今日已签 · 连续 7 天"
     var brief: String {
@@ -66,11 +63,9 @@ extension WorkbuddySnapshot {
         var list: [CreditPackage] = []
         for item in (obj["packages"] as? [[String: Any]]) ?? [] {
             list.append(CreditPackage(
-                code: (item["code"] as? String) ?? "",
                 name: (item["name"] as? String) ?? "积分包",
                 total: fuelDbl(item["total"]),
-                remain: fuelDbl(item["remain"]),
-                used: fuelDbl(item["used"])
+                remain: fuelDbl(item["remain"])
             ))
         }
         packages = list.filter { $0.total > 0 || $0.remain > 0 }
@@ -79,8 +74,7 @@ extension WorkbuddySnapshot {
                 today: (c["today"] as? Bool) ?? false,
                 streak: Int(fuelDbl(c["streak"])),
                 week: Int(fuelDbl(c["week"])),
-                daily: fuelDbl(c["daily"]),
-                activity: (c["activity"] as? String) ?? ""
+                daily: fuelDbl(c["daily"])
             )
         } else {
             checkin = nil

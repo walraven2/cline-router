@@ -111,7 +111,6 @@ func ensureAppSupportReady() {
 
 struct RouterConfig {
     var port = 4000
-    var authKey = ""
     var defaultModel = ""
     var modelIds: [String] = []
     var modelDetails: [(id: String, upstream: String, model: String)] = []
@@ -139,7 +138,6 @@ struct RouterConfig {
             return cfg
         }
         if let p = obj["port"] as? Int { cfg.port = p }
-        if let k = obj["auth_key"] as? String { cfg.authKey = k }
         if let dm = obj["default_model"] as? String { cfg.defaultModel = dm }
         if let models = obj["models"] as? [[String: Any]] {
             for m in models {
@@ -211,7 +209,6 @@ func syncHealth(port: Int) -> (Bool, [String]) {
 
 final class RouterService {
     private(set) var running = false
-    private(set) var modelCount = 0
 
     func refresh(completion: (() -> Void)? = nil) {
         let cfg = RouterConfig.load()
@@ -219,10 +216,9 @@ final class RouterService {
         var req = URLRequest(url: url)
         req.timeoutInterval = 3
         URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            let (ok, models) = parseHealth(data)
+            let (ok, _) = parseHealth(data)
             DispatchQueue.main.async {
                 self?.running = ok
-                self?.modelCount = models.count
                 completion?()
             }
         }.resume()

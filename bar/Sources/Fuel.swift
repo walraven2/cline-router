@@ -10,7 +10,6 @@ struct FuelWindow {
     let label: String
     let shortLabel: String
     let quota: Double
-    let used: Double
     let remaining: Double
     let percent: Double
     let resetAt: String
@@ -62,7 +61,6 @@ extension FuelSnapshot {
                 label: (w["label"] as? String) ?? fallbackLabel,
                 shortLabel: short,
                 quota: quota,
-                used: used,
                 remaining: remaining,
                 percent: w["percent"] == nil ? (quota > 0 ? used / quota * 100 : 0) : fuelDbl(w["percent"]),
                 resetAt: (w["reset_at"] as? String) ?? "",
