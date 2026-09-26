@@ -114,6 +114,8 @@ struct RouterConfig {
     var defaultModel = ""
     var modelIds: [String] = []
     var modelDetails: [(id: String, upstream: String, model: String)] = []
+    /// 免费模型降级组（models.json 的 free_models）：额度用尽时按此顺序自动切换
+    var freeModels: [String] = []
 
     // 配置几乎不变：按 mtime+size 缓存，避免「5 秒轮询 + 两个 30 秒监控 + 每次开菜单」都读盘并解析 JSON
     private static let cacheLock = NSLock()
@@ -148,9 +150,58 @@ struct RouterConfig {
                                          model: (m["model"] as? String) ?? ""))
             }
         }
+        if let free = obj["free_models"] as? [String] { cfg.freeModels = free }
         cached = (stamp, cfg)
         return cfg
     }
+}
+
+// MARK: - 免费模型额度状态
+//
+// 数据源：与 models.json 同目录的 free-quota.json，由 router 在真的撞上
+// 429「Daily free limit reached ... Try again in Xh Ym」时写入（不做主动探测）。
+// 这里只读；到期即视为已恢复，与 free_quota.py 的 state_of() 判定保持一致。
+
+let quotaPath = appSupportDir + "/free-quota.json"
+
+struct FreeQuotaEntry {
+    var status = "unknown"   // ok / exhausted / blocked / unknown
+    var remaining = 0        // 剩余秒数（仅 exhausted 有意义）
+    var text = ""            // "17h 39m"
+    var message = ""         // 上游原文，用于 tooltip
+}
+
+func fmtCountdown(_ seconds: Int) -> String {
+    if seconds <= 0 { return "now" }
+    let h = seconds / 3600
+    let m = (seconds % 3600) / 60
+    if h > 0 { return "\(h)h \(m)m" }
+    if m > 0 { return "\(m)m" }
+    return "\(seconds)s"
+}
+
+/// 读取 free-quota.json；不存在或无记录返回空字典。
+func loadFreeQuota() -> [String: FreeQuotaEntry] {
+    guard let data = FileManager.default.contents(atPath: quotaPath),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let models = obj["models"] as? [String: Any] else { return [:] }
+    let now = Int(Date().timeIntervalSince1970)
+    var out: [String: FreeQuotaEntry] = [:]
+    for (alias, value) in models {
+        guard let rec = value as? [String: Any] else { continue }
+        var e = FreeQuotaEntry()
+        e.status = (rec["status"] as? String) ?? "unknown"
+        e.message = (rec["msg"] as? String) ?? ""
+        let until = (rec["until"] as? NSNumber)?.intValue ?? 0
+        if e.status == "exhausted" && until > 0 && now >= until {
+            e.status = "ok"                     // 已到期：自动恢复
+        } else if e.status == "exhausted" && until > 0 {
+            e.remaining = until - now
+            e.text = fmtCountdown(e.remaining)
+        }
+        out[alias] = e
+    }
+    return out
 }
 
 // MARK: - 日志尾部

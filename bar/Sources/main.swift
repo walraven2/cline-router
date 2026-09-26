@@ -83,6 +83,14 @@ func measure<T>(_ label: String, _ body: () -> T) -> T {
     return result
 }
 
+/// 菜单栏 App 的普通日志（不受 PERF 阈值限制），用于记录自动降级等事件
+func barLog(_ msg: String) {
+    let line = "[\(perfFormatter.string(from: Date()))] \(msg)\n"
+    guard let h = openAppendHandle(barLogPath), let data = line.data(using: .utf8) else { return }
+    h.write(data)
+    try? h.close()
+}
+
 // MARK: - 菜单栏应用
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -100,12 +108,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var copyItem: NSMenuItem!
     private var defItem: NSMenuItem!
     private let defMenu = NSMenu()
+    private var refreshFreeItem: NSMenuItem!
     private var logItem: NSMenuItem!
     private let logMenu = NSMenu()
     private var restartItem: NSMenuItem!
     private var startItem: NSMenuItem!
     private var stopItem: NSMenuItem!
     private var loginItem: NSMenuItem!
+    /// 自动降级防抖：记录上次因「免费额度用尽」而切换的模型与时间
+    private var lastAutoSwitch: (id: String, at: Date)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 防重复实例：用文件锁（flock）而不是 NSRunningApplication 计数 ——
@@ -458,6 +469,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defItem.submenu = defMenu
         menu.addItem(defItem)
 
+        // 免费额度：手动刷新（只探 free_models 组，默认 6 个，不做全量扫描）
+        refreshFreeItem = NSMenuItem(title: "刷新免费额度…", action: #selector(refreshFreeQuota),
+                                     keyEquivalent: "")
+        refreshFreeItem.target = self
+        menu.addItem(refreshFreeItem)
+
         // 最近请求子菜单
         logItem = NSMenuItem(title: "最近请求", action: nil, keyEquivalent: "")
         logMenu.autoenablesItems = false
@@ -496,7 +513,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 纯文本与少量子菜单重建，实测 1~3ms。
     func refreshMenuData() {
         refreshStatus()
-        fillDefaultMenu(RouterConfig.load())
+        let cfg = RouterConfig.load()
+        autoSwitchExhaustedDefault(cfg)   // 免费额度用尽 → 自动切到组内下一个可用项
+        fillDefaultMenu(cfg)
         fuelItem.title = fuelMenuTitle()
         fillFuelMenu()
         creditsItem.title = creditsMenuTitle()
@@ -535,11 +554,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             hint.isEnabled = false
             defMenu.addItem(hint)
             defMenu.addItem(.separator())
+            let quota = loadFreeQuota()
+            let freeSet = Set(cfg.freeModels)
+            var separated = false
             for m in cfg.modelDetails {
-                let item = NSMenuItem(title: m.id, action: #selector(setDefaultModel(_:)), keyEquivalent: "")
+                let isFree = freeSet.contains(m.id)
+                // 免费组与其余模型之间加一条分隔线（free_models 在清单里排在最前）
+                if !isFree && !separated && !cfg.freeModels.isEmpty {
+                    defMenu.addItem(.separator())
+                    separated = true
+                }
+                var title = m.id
+                var enabled = true
+                var tip = m.model
+                if isFree, let q = quota[m.id] {
+                    if q.status == "exhausted" {
+                        // 灰显 + 恢复倒计时；没有恢复时间就只写「额度用尽」
+                        title = q.text.isEmpty ? "\(m.id)（额度用尽）" : "\(m.id)（\(q.text) 后恢复）"
+                        enabled = false
+                        tip = q.message.isEmpty ? "今日免费额度已用尽" : q.message
+                    } else if q.status == "blocked" {
+                        title = "\(m.id)（不可用）"
+                        enabled = false
+                        tip = q.message.isEmpty ? "当前账号不可用" : q.message
+                    }
+                }
+                let item = NSMenuItem(title: title, action: #selector(setDefaultModel(_:)), keyEquivalent: "")
                 item.target = self
+                item.isEnabled = enabled
                 item.representedObject = m.id
-                item.toolTip = m.model
+                item.toolTip = tip
                 if m.id == cfg.defaultModel { item.state = .on }
                 defMenu.addItem(item)
             }
@@ -584,6 +628,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func setDefaultModel(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
+        switchDefaultModel(to: id, beepOnFailure: true)
+    }
+
+    /// 切换默认模型（Cline 侧的 auto 立即走这个）。自动降级也复用它。
+    func switchDefaultModel(to id: String, beepOnFailure: Bool = false) {
         let cfg = RouterConfig.load()
         guard let url = URL(string: "http://127.0.0.1:\(cfg.port)/api/default") else { return }
         var req = URLRequest(url: url)
@@ -597,11 +646,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { [weak self] in
                 if code == 200 {
                     self?.refreshSoon(0.3)
-                } else {
+                } else if beepOnFailure {
                     NSSound.beep()
                 }
             }
         }.resume()
+    }
+
+    /// 手动刷新免费额度：路由端只探 free_models 组（默认 6 个），后台探测，
+    /// 请求立即返回；这里过几秒再刷几次菜单把结果呈现出来。
+    @objc func refreshFreeQuota() {
+        let cfg = RouterConfig.load()
+        guard let url = URL(string: "http://127.0.0.1:\(cfg.port)/api/free-quota/refresh") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 5
+        req.setValue("1", forHTTPHeaderField: "X-Router-UI")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [String: String]())
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            DispatchQueue.main.async { [weak self] in
+                if code != 200 {
+                    NSSound.beep()
+                    return
+                }
+                barLog("手动刷新免费额度已触发")
+                // 探测是后台的，分几次回看结果（探测最慢的推理模型可能要约 1 分钟）
+                for delay in [4.0, 12.0, 30.0, 65.0] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        self?.refreshSoon(0.0)
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    /// 默认模型若在免费降级组里且额度已用尽 → 自动切到组内第一个可用项。
+    /// （用户要求：「如果用量用完了…然后自动跳转另一个免费的」）
+    /// 只在免费组内切换，绝不动用户自选的付费模型。
+    private func autoSwitchExhaustedDefault(_ cfg: RouterConfig) {
+        guard service.running, !cfg.freeModels.isEmpty,
+              cfg.freeModels.contains(cfg.defaultModel) else { return }
+        // 防抖：同一个模型 60 秒内只尝试一次，避免切换失败时反复触发
+        let now = Date()
+        if let last = lastAutoSwitch, last.id == cfg.defaultModel,
+           now.timeIntervalSince(last.at) < 60 { return }
+
+        let quota = loadFreeQuota()
+        guard let cur = quota[cfg.defaultModel], cur.status == "exhausted" else { return }
+        guard let target = cfg.freeModels.first(where: { alias in
+            guard alias != cfg.defaultModel else { return false }
+            let st = quota[alias]?.status ?? "unknown"
+            return st != "exhausted" && st != "blocked"
+        }) else { return }
+
+        lastAutoSwitch = (cfg.defaultModel, now)
+        barLog("AUTO-SWITCH \(cfg.defaultModel) 额度用尽 → \(target)"
+               + (cur.text.isEmpty ? "" : "（\(cur.text) 后恢复）"))
+        switchDefaultModel(to: target)
     }
 
     private func copyToClipboard(_ text: String) {

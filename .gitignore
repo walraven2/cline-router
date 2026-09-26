@@ -13,6 +13,7 @@ build/
 bar/build/
 bar/dist/
 Cline 路由.app/
+Cline 路由.app.old/
 *.icns
 *.pyc
 __pycache__/

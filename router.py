@@ -11,9 +11,20 @@ Cline 侧只填一个 OpenAI Compatible 配置：
 
 保留模型名 auto：请求 model=auto 时自动路由到 default_model（当前默认模型）。
 
+免费模型自动降级（models.json 的 free_models 数组）：
+    Cline 的免费模型有「每日额度」，用尽后上游返回 429
+    "Daily free limit reached on model X. Try again in 17h 39m"。
+    凡请求的模型属于 free_models 组，且撞上上述 429，本路由会：
+      ① 解析出恢复时刻并记到 free-quota.json（不做任何主动探测）；
+      ② 自动按 free_models 顺序换下一个「额度未耗尽」的免费模型重试，
+         客户端无感知（日志里能看到 FREE-EXHAUSTED / FREE-FALLBACK）。
+    组内全部用尽时返回 429 并附各模型的恢复倒计时。
+
 对外端点：
     GET  /ui                       图形化配置面板（含 Seedream 绘图）
     GET  /api/config               读取配置（面板用）
+    GET  /api/free-quota           免费模型额度状态（菜单栏灰显 + 倒计时用）
+    POST /api/free-quota/refresh   只探 free_models 组（默认 6 个）刷新额度（需 X-Router-UI 头）
     POST /api/config               保存配置并热加载（面板用，需 X-Router-UI 头）
     POST /api/default              切换默认模型（面板/菜单栏用，需 X-Router-UI 头）
     POST /api/test                 连通性测试单个对话模型（面板用）
@@ -58,6 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import admin_ui
 import codebuddy
+import free_quota
 import volc_fuel
 import workbuddy_credits
 import responses_api
@@ -146,6 +158,80 @@ def _expand(value):
     return value
 
 
+# ---------------- 免费模型额度跟踪 ----------------
+# 不做主动探测（全量探测会被 Cloudflare 限流，且免费模型只有固定几个）：
+# 只在请求真的撞上 429「Daily free limit reached ... Try again in Xh Ym」时记录恢复时刻，
+# 到期自动恢复可用。状态落盘 free-quota.json，供菜单栏灰显 + 倒计时。
+_QUOTA = None
+_QUOTA_LOCK = threading.Lock()
+
+
+def get_quota(config_path):
+    """返回与 models.json 同目录的 free-quota.json 状态器（进程内单例）。"""
+    global _QUOTA
+    target = os.path.join(os.path.dirname(os.path.abspath(config_path)), "free-quota.json")
+    with _QUOTA_LOCK:
+        if _QUOTA is None or _QUOTA.path != target:
+            _QUOTA = free_quota.FreeQuota(target)
+        return _QUOTA
+
+
+def probe_one_free(up, model, timeout=45):
+    """探测单个免费模型，返回 (status, msg)。
+
+    max_tokens 不能给 1：推理模型会把这点额度全花在 reasoning 上，回一个
+    500 "empty response content"（实测 gemini-3.8-flash / space-bunny-alpha 都是），
+    会把可用模型误判成不可用。给 32 既够判定又几乎不耗额度。
+    """
+    payload = {"model": model, "messages": [{"role": "user", "content": "ok"}],
+               "max_tokens": 32, "stream": False}
+    status, text = upstream_call(up, payload, timeout=timeout)
+    low = (text or "").lower()
+    if free_quota.is_free_limit_error(text):
+        return "exhausted", text
+    if "access forbidden" in low or "not available in your region" in low:
+        return "blocked", text
+    if status == 200 or "empty response content" in low:
+        return "ok", ""
+    return "", (text or "")[:200]
+
+
+def refresh_free_quota(cfg, quota):
+    """只探测 free_models 组里的免费模型（默认 6 个），刷新额度状态。
+
+    刻意**不做全量探测**：扫 300+ 候选会被 Cloudflare 限流（实测并发 16 时
+    300/369 都拿到 429 + HTML 错误页，会把 claude-opus 这种付费模型误报成免费），
+    而免费模型本来就只有固定这几个，扫它没有意义。
+    """
+    done = 0
+    for alias in getattr(cfg, "free_models", None) or []:
+        entry = cfg.models.get(alias)
+        if not entry:
+            continue
+        up = cfg.upstreams.get(entry["upstream"])
+        if not up:
+            continue
+        try:
+            st, msg = probe_one_free(up, entry["model"])
+        except Exception as exc:
+            log("FREE-PROBE %s 探测异常：%r" % (alias, exc))
+            continue
+        if st == "ok":
+            quota.mark_ok(alias, entry["model"])
+        elif st == "exhausted":
+            secs = quota.mark_exhausted(alias, msg, entry["model"])
+            log("FREE-PROBE %s 额度用尽（约 %s 后恢复）"
+                % (alias, free_quota.fmt_remaining(secs) if secs else "未知"))
+        elif st == "blocked":
+            quota.mark_blocked(alias, msg, entry["model"])
+            log("FREE-PROBE %s 不可用：%s" % (alias, (msg or "")[:80]))
+        else:
+            continue                    # 状态不明：保留原结论，不误改
+        done += 1
+        time.sleep(0.3)                 # 轻微间隔，别把上游打成限流
+    return done
+
+
 class Config:
     def __init__(self, path):
         with open(path, "r", encoding="utf-8") as f:
@@ -215,6 +301,9 @@ class Config:
             self.default_model = next(iter(self.models), "")
         # only_auto=true 时 /v1/models 只暴露 auto（Cline 下拉里就只有它）
         self.only_auto = bool(raw.get("only_auto", False))
+        # 免费模型降级组：额度用尽时按此顺序自动切到下一个可用项（见 free_quota.py）
+        group = raw.get("free_models") or []
+        self.free_models = [a for a in group if isinstance(a, str) and a in self.models]
 
 
 # ---------------- 配置读写与校验（配置面板用） ----------------
@@ -370,6 +459,59 @@ def upstream_call(up, payload, timeout=None, path=None):
         return 0, repr(exc)
 
 
+# 思考 token 吃光额度时，上游有时会回 ")\n" 这类无意义残渣而非空串。
+# 截断后正文短于此长度即视为「没答出东西」，触发降级重试。
+_EMPTY_JUNK_MAX = 8
+
+
+def is_empty_content(status, text):
+    """判断响应是否为「成功但正文为空」——推理模型的经典失败形态。
+
+    两类都要抓：
+    1) 上游 500 "empty response content"：思考 token 吃光额度，没吐出正文；
+    2) 200 + finish_reason=length + 正文为空/仅剩残渣：
+       max_tokens 全被 reasoning 消耗，正文只剩 "" 或 ")\n"。
+
+    这类响应对客户端等于「什么都没拿到」，必须当失败处理并降级，
+    否则 Cline 会把空回答当成模型答了。
+    """
+    low = (text or "").lower()
+    if "empty response content" in low:
+        return True
+    if not (status and 200 <= status < 300):
+        return False  # 其它错误一律按原样透传，不属于「空内容」
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return False
+    if isinstance(obj, dict) and isinstance(obj.get("data"), dict):
+        obj = obj["data"]  # {"data": {...}} 信封
+    choices = obj.get("choices") if isinstance(obj, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    if not isinstance(first, dict):
+        return False
+    msg = first.get("message") or {}
+    content = msg.get("content")
+    is_block = isinstance(content, list)  # 部分上游用内容块数组
+    if is_block:
+        content = "".join(
+            c.get("text", "") for c in content if isinstance(c, dict))
+    if isinstance(content, str) and content.strip():
+        # 正文非空：但若是「被长度截断后只剩残渣」也算失败——
+        # 实测 gemini 思考 token 吃光额度时会回 ")\n" 这种无意义片段，
+        # 它比空回答更坏：客户端会把它当成有效回答直接显示给用户。
+        if str(first.get("finish_reason") or "").lower() == "length":
+            if is_block:
+                return False  # 内容块数组：长度不参与判定，避免误伤「hi」这类短回答
+            return len(content.strip()) < _EMPTY_JUNK_MAX
+        return False  # 真有正文
+    # 正文空：仅当上游明说被长度截断才认定为「空内容失败」，
+    # 避免把 stop 正常结束的空回答也拖去重试。
+    return str(first.get("finish_reason") or "").lower() == "length"
+
+
 class Router(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "cline-router/1.0"
@@ -436,6 +578,7 @@ class Router(BaseHTTPRequestHandler):
             "upstreams": raw.get("upstreams") or {},
             "models": raw.get("models") or [],
             "images": raw.get("images") or [],
+            "free_models": raw.get("free_models") or [],
             "active_models": sorted(self.config.models),
             "active_images": sorted(self.config.images),
         }
@@ -461,6 +604,10 @@ class Router(BaseHTTPRequestHandler):
             "upstreams": payload.get("upstreams") or {},
             "models": payload.get("models") or [],
             "images": payload.get("images") or [],
+            # free_models 是免费降级组，配置面板不编辑它：面板没传就沿用磁盘值，绝不丢
+            "free_models": (payload.get("free_models")
+                            if isinstance(payload.get("free_models"), list)
+                            else ((load_raw_config(self.config.path) or {}).get("free_models") or [])),
         }
         try:
             errors = validate_config(new_raw)
@@ -657,13 +804,65 @@ class Router(BaseHTTPRequestHandler):
         with open(full, "rb") as fh:
             self._send_bytes(200, fh.read(), ctype)
 
-    def _relay_json_unwrapped(self, up, payload, mid, entry):
-        """非流式响应的缓冲区模式：必要时拆掉 {"data": {...}} 信封后再返回给客户端。"""
+    def _relay_json_unwrapped(self, up, payload, mid, entry, cands=None):
+        """非流式响应的缓冲区模式：必要时拆掉 {"data": {...}} 信封后再返回给客户端。
+
+        cands 给出多个候选时做「免费额度降级」：当前免费模型额度用尽
+        （429 Daily free limit reached ... Try again in Xh Ym）就自动换下一个可用项。
+
+        另加「空内容降级」：推理模型（尤其 Gemini 3.8 flash，思考占比极高）
+        常回 500 empty response content 或 200+finish_reason=length 且正文为空，
+        对客户端等于什么都没拿到。碰到这类响应就换下一个免费模型重试，
+        最多换一个，避免把空回答交给 Cline。
+        """
         started = time.time()
-        status, text = upstream_call(up, payload, timeout=up["timeout"])
+        quota = get_quota(self.config.path)
+        group = set(getattr(self.config, "free_models", None) or [])
+        exhausted = []
+        empty_retried = False
+        status, text = 0, ""
+        cands = list(cands or [(mid, entry)])
+        for idx, (c_mid, c_entry) in enumerate(cands):
+            payload["model"] = c_entry["model"]
+            status, text = upstream_call(up, payload, timeout=up["timeout"])
+            if free_quota.is_free_limit_error(text):
+                secs = quota.mark_exhausted(c_mid, text, c_entry["model"])
+                exhausted.append(c_mid)
+                log("FREE-EXHAUSTED %s（约 %s 后恢复）"
+                    % (c_mid, free_quota.fmt_remaining(secs) if secs else "未知"))
+                continue
+            # 空内容：仅当后面还有候选、且本请求还没重试过，才降级换一个（最多换一次）
+            if (is_empty_content(status, text)
+                    and not empty_retried and idx + 1 < len(cands)):
+                empty_retried = True
+                log("FREE-EMPTY %s -> %s 返回空内容，降级重试下一个免费模型"
+                    % (c_mid, c_entry["model"]))
+                continue
+            if status and 200 <= status < 300 and c_mid in group:
+                quota.mark_ok(c_mid, c_entry["model"])
+            if c_mid != mid and status and 200 <= status < 300:
+                log("FREE-FALLBACK %s -> %s（免费额度降级）" % (mid, c_mid))
+            mid, entry = c_mid, c_entry
+            break
+        else:
+            detail = "、".join(
+                "%s(%s后恢复)" % (a, free_quota.fmt_remaining(quota.state_of(a)["remaining"]))
+                if quota.state_of(a)["remaining"] else a
+                for a in exhausted)
+            return self._send_json(429, {"error": {"message":
+                "免费模型额度已用尽：%s。请稍后重试或切换其它模型。" % detail}})
+
         if not status:
             log("FAIL %s -> %s [%s] 连接上游失败: %s" % (mid, entry["model"], entry["upstream"], text[:200]))
             return self._send_json(502, {"error": {"message": "连接上游失败: %s" % text[:300]}})
+        # 兜底：所有候选都空内容且无其它候选可换时，明确报错，
+        # 绝不把「成功但正文为空」的响应当正常结果交给客户端。
+        if is_empty_content(status, text):
+            log("FAIL %s -> %s [%s] %s 空内容且已无可降级模型"
+                % (mid, entry["model"], entry["upstream"], status))
+            return self._send_json(502, {"error": {"message":
+                "模型返回空内容（思考 token 耗尽），请重试或切换其它模型。"},
+                "error_type": "empty_response"})
         body = text
         try:
             obj = json.loads(text)
@@ -680,8 +879,11 @@ class Router(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
-        log("OK %s -> %s [%s] %s %.1fs %dB%s" % (
-            mid, entry["model"], entry["upstream"], status,
+        # 只有 2xx 才算 OK；上游 4xx/5xx 原样透传时必须记 FAIL，
+        # 否则日志里一片 OK，故障会被彻底掩盖（曾导致 500 empty response content 被误读为正常）。
+        ok = 200 <= status < 300
+        log("%s %s -> %s [%s] %s %.1fs %dB%s" % (
+            "OK" if ok else "FAIL", mid, entry["model"], entry["upstream"], status,
             time.time() - started, len(raw), "（信封已拆）" if len(body) != len(text) else ""))
 
     # ---------------- CodeBuddy 官方协议（详见 codebuddy.py） ----------------
@@ -745,6 +947,26 @@ class Router(BaseHTTPRequestHandler):
             default_tip = "；填 auto 可用默认模型 %s" % self.config.default_model if self.config.default_model else ""
             return None, None, "未知模型 %r%s；可用: %s%s" % (mid, hint, ", ".join(sorted(self.config.models)), default_tip)
         return entry, self.config.upstreams[entry["upstream"]], None
+
+    def _free_candidates(self, mid, entry):
+        """免费模型降级候选。
+
+        当前模型在 free_models 组里时，返回 [(别名, entry), ...]：
+        当前项优先，其后只放「额度未耗尽」的其它免费模型（顺序按 free_models）。
+        不在免费组里则原样返回单个候选，行为与从前完全一致。
+        """
+        group = getattr(self.config, "free_models", None) or []
+        if mid not in group:
+            return [(mid, entry)]
+        q = get_quota(self.config.path)
+        out = [(mid, entry)]
+        for alias in group:
+            if alias == mid or not q.is_available(alias):
+                continue
+            e = self.config.models.get(alias)
+            if e:
+                out.append((alias, e))
+        return out
 
     def _handle_responses(self, payload):
         """POST /v1/responses：Responses API ⇄ Chat Completions 翻译（Codex 用）。"""
@@ -898,6 +1120,10 @@ class Router(BaseHTTPRequestHandler):
             return self._send_html(admin_ui.HTML)
         if path == "/api/config":
             return self._send_json(200, self._config_payload())
+        if path == "/api/free-quota":
+            # 免费模型额度状态（菜单栏灰显 + 倒计时用）。纯读，无副作用。
+            raw = load_raw_config(self.config.path) or self.config.raw
+            return self._send_json(200, get_quota(self.config.path).snapshot(raw))
         if path.startswith("/images/"):
             return self._serve_image_file(path)
         if path in ("/v1/models", "/models"):
@@ -929,6 +1155,22 @@ class Router(BaseHTTPRequestHandler):
             return self._handle_save_config()
         if path == "/api/default":
             return self._handle_set_default()
+        if path == "/api/free-quota/refresh":
+            # 只探 free_models 组（默认 6 个）。后台跑，立即返回，别卡住菜单栏。
+            if not self._ui_ok():
+                return self._send_json(403, {"error": {"message": "缺少 X-Router-UI 头（防跨站请求）"}})
+            cfg_now = self.config
+
+            def _probe_bg():
+                try:
+                    refresh_free_quota(cfg_now, get_quota(cfg_now.path))
+                except Exception as exc:
+                    log("FREE-PROBE 手动刷新失败：%r" % exc)
+
+            threading.Thread(target=_probe_bg, daemon=True, name="free-quota-manual").start()
+            raw_now = load_raw_config(self.config.path) or self.config.raw
+            return self._send_json(200, {"ok": True, "started": True,
+                                         **get_quota(self.config.path).snapshot(raw_now)})
         if path == "/api/fuel/refresh":
             return self._handle_fuel_refresh()
         if path == "/api/workbuddy/refresh":
@@ -971,30 +1213,63 @@ class Router(BaseHTTPRequestHandler):
         if up["mode"] == codebuddy.MODE:
             return self._handle_codebuddy(up, payload, mid, entry)
 
+        # 免费模型降级候选：不在 free_models 组里就只有当前一个，行为与从前完全一致
+        cands = self._free_candidates(mid, entry)
+        quota = get_quota(self.config.path)
+        group = set(getattr(self.config, "free_models", None) or [])
+
         # 非流式 + 该上游开了 unwrap_data：走缓冲区模式，拆掉 {"data": ...} 信封
         if up["unwrap_data"] and not payload.get("stream"):
-            return self._relay_json_unwrapped(up, payload, mid, entry)
-
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers = build_headers(up, self.headers.get("User-Agent"))
-        req = urllib.request.Request(up["base_url"] + (up["path"] or "/chat/completions"),
-                                     data=body, headers=headers, method="POST")
+            return self._relay_json_unwrapped(up, payload, mid, entry, cands)
 
         started = time.time()
-        try:
-            resp = build_opener(up).open(req, timeout=up["timeout"])
-        except urllib.error.HTTPError as exc:
-            detail = exc.read()
-            log("FAIL %s -> %s [%s] 上游 HTTP %s" % (mid, entry["model"], entry["upstream"], exc.code))
-            self.send_response(exc.code)
-            self.send_header("Content-Type", exc.headers.get("Content-Type") or "application/json")
-            self.send_header("Content-Length", str(len(detail)))
-            self.end_headers()
-            self.wfile.write(detail)
-            return
-        except Exception as exc:
-            log("FAIL %s -> %s [%s] 连接上游失败: %r" % (mid, entry["model"], entry["upstream"], exc))
-            return self._send_json(502, {"error": {"message": "连接上游失败: %r" % exc}})
+        resp = None
+        exhausted = []
+        for c_mid, c_entry in cands:
+            payload["model"] = c_entry["model"]   # 本地别名 -> 上游真实模型名
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers = build_headers(up, self.headers.get("User-Agent"))
+            req = urllib.request.Request(up["base_url"] + (up["path"] or "/chat/completions"),
+                                         data=body, headers=headers, method="POST")
+            try:
+                resp = build_opener(up).open(req, timeout=up["timeout"])
+            except urllib.error.HTTPError as exc:
+                detail = exc.read()
+                text = detail.decode("utf-8", "replace")
+                if free_quota.is_free_limit_error(text):
+                    # 该免费模型今日额度用尽：记录恢复时刻，换下一个免费模型
+                    secs = quota.mark_exhausted(c_mid, text, c_entry["model"])
+                    exhausted.append(c_mid)
+                    log("FREE-EXHAUSTED %s（约 %s 后恢复）"
+                        % (c_mid, free_quota.fmt_remaining(secs) if secs else "未知"))
+                    continue
+                log("FAIL %s -> %s [%s] 上游 HTTP %s"
+                    % (c_mid, c_entry["model"], c_entry["upstream"], exc.code))
+                self.send_response(exc.code)
+                self.send_header("Content-Type", exc.headers.get("Content-Type") or "application/json")
+                self.send_header("Content-Length", str(len(detail)))
+                self.end_headers()
+                self.wfile.write(detail)
+                return
+            except Exception as exc:
+                log("FAIL %s -> %s [%s] 连接上游失败: %r"
+                    % (c_mid, c_entry["model"], c_entry["upstream"], exc))
+                return self._send_json(502, {"error": {"message": "连接上游失败: %r" % exc}})
+
+            if c_mid in group:
+                quota.mark_ok(c_mid, c_entry["model"])
+            if c_mid != mid:
+                log("FREE-FALLBACK %s -> %s（免费额度降级）" % (mid, c_mid))
+            mid, entry = c_mid, c_entry
+            break
+
+        if resp is None:
+            detail = "、".join(
+                "%s(%s后恢复)" % (a, free_quota.fmt_remaining(quota.state_of(a)["remaining"]))
+                if quota.state_of(a)["remaining"] else a
+                for a in exhausted)
+            return self._send_json(429, {"error": {"message":
+                "免费模型额度已用尽：%s。请稍后重试或切换其它模型。" % detail}})
 
         self._relay(resp, mid, entry, started)
 
@@ -1145,6 +1420,20 @@ def main():
     # 或 macOS 桌面端 CodeBuddyExtension auth/*.info，无需手工配置）
     credits = workbuddy_credits.start_monitor(300, data_dir)
     log("积分监控：已启动（每 300s 刷新，凭据 %s）" % credits.source)
+
+    # 免费额度初值：只探 free_models 组（默认 6 个），后台跑，不拖慢启动。
+    # 目的仅是把「哪些已用尽、还有多久恢复」先填上，菜单栏才能正确灰显；
+    # 之后靠真实请求里的 429 持续更新，不做任何周期性探测。
+    def _quota_boot():
+        time.sleep(3)
+        try:
+            n = refresh_free_quota(Router.config, get_quota(Router.config.path))
+            log("免费额度初值已刷新（探测 %d 个）" % n)
+        except Exception as exc:
+            log("免费额度初值刷新失败：%r" % exc)
+
+    threading.Thread(target=_quota_boot, daemon=True, name="free-quota-boot").start()
+
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

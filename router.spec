@@ -19,7 +19,8 @@ a = Analysis(
     pathex=["."],
     binaries=[],
     datas=[],
-    hiddenimports=["admin_ui", "codebuddy", "volc_fuel", "workbuddy_credits"],   # router.py 的本地依赖，显式声明保证一定收进来
+    hiddenimports=["admin_ui", "codebuddy", "free_quota", "responses_api",
+                   "volc_fuel", "workbuddy_credits"],   # router.py 的本地依赖，显式声明保证一定收进来
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

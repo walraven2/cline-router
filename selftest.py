@@ -251,7 +251,6 @@ def main():
             failures.append("流式 responses 缺少 response.output_text.delta 事件")
         if events[-1] != "response.completed":
             failures.append("流式 responses 末事件应为 response.completed，实际 %r" % events[-1])
-        import re as _re
         comp = None
         for blk in ev_stream.split("event: "):
             if blk.startswith("response.completed"):

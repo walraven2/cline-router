@@ -43,57 +43,21 @@
       "proxy": ""
     }
   },
+  "images": [
+    {
+      "id": "seedream-pro",
+      "upstream": "volc",
+      "model": "doubao-seedream-5.0-pro",
+      "size": "1024x1024"
+    },
+    {
+      "id": "seedream-lite",
+      "upstream": "volc",
+      "model": "doubao-seedream-5.0-lite",
+      "size": "2048x2048"
+    }
+  ],
   "models": [
-    {
-      "id": "cline-free-ling-sante",
-      "upstream": "cline",
-      "model": "inclusionai/ling-3.0-flash-sante:free"
-    },
-    {
-      "id": "cline-free-nemotron",
-      "upstream": "cline",
-      "model": "nvidia/nemotron-3-super-120b-a12b:free"
-    },
-    {
-      "id": "cline-free-laguna",
-      "upstream": "cline",
-      "model": "poolside/laguna-s-2.1:free"
-    },
-    {
-      "id": "cline-free-north",
-      "upstream": "cline",
-      "model": "cohere/north-mini-code:free"
-    },
-    {
-      "id": "cline-free-nemotron-ultra",
-      "upstream": "cline",
-      "model": "nvidia/nemotron-3-ultra-550b-a55b:free"
-    },
-    {
-      "id": "cline-free-nemotron-light",
-      "upstream": "cline",
-      "model": "nvidia/nemotron-3.5-lightning:free"
-    },
-    {
-      "id": "cline-free-nemotron-nano",
-      "upstream": "cline",
-      "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-    },
-    {
-      "id": "cline-free-bunny",
-      "upstream": "cline",
-      "model": "stealth/space-bunny-alpha"
-    },
-    {
-      "id": "cline-free-mimo",
-      "upstream": "cline",
-      "model": "cline-free/mimo-v2.6-flash"
-    },
-    {
-      "id": "cline-free-deepseek41",
-      "upstream": "cline",
-      "model": "cline-free/deepseek-v4.1-flash"
-    },
     {
       "id": "volc-doubao-mini",
       "upstream": "volc",
@@ -193,20 +157,38 @@
       "id": "cb-kimi-k25",
       "upstream": "codebuddy",
       "model": "kimi-k2.5"
-    }
-  ],
-  "images": [
-    {
-      "id": "seedream-pro",
-      "upstream": "volc",
-      "model": "doubao-seedream-5.0-pro",
-      "size": "1024x1024"
     },
     {
-      "id": "seedream-lite",
-      "upstream": "volc",
-      "model": "doubao-seedream-5.0-lite",
-      "size": "2048x2048"
+      "id": "cline-free-bunny",
+      "upstream": "cline",
+      "model": "stealth/space-bunny-alpha"
+    },
+    {
+      "id": "cline-free-mimo",
+      "upstream": "cline",
+      "model": "cline-free/mimo-v2.6-flash"
+    },
+    {
+      "id": "cline-free-deepseek41",
+      "upstream": "cline",
+      "model": "cline-free/deepseek-v4.1-flash"
+    },
+    {
+      "id": "cline-free-gemini38",
+      "upstream": "cline",
+      "model": "cline-free/gemini-3.8-flash"
+    },
+    {
+      "id": "cline-free-pixel",
+      "upstream": "cline",
+      "model": "stealth/pixel-canary"
     }
+  ],
+  "free_models": [
+    "cline-free-gemini38",
+    "cline-free-bunny",
+    "cline-free-deepseek41",
+    "cline-free-mimo",
+    "cline-free-pixel"
   ]
 }
