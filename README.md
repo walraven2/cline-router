@@ -45,7 +45,7 @@ Cline（Model ID = auto）──> http://127.0.0.1:4000/v1 ──┬──> http
 | `bar/Sources/Fuel.swift` | 菜单栏「燃料」一行：轮询 `/api/fuel`，展示火山套餐余额 |
 | `bar/Sources/Credits.swift` | 菜单栏「积分」一行：轮询 `/api/workbuddy`，展示 WorkBuddy 积分与签到 |
 | `bar/build.sh` | 编译打包 `Cline 路由.app`（冻结路由器 + 编译菜单栏 App）：`build / run / install / clean` |
-| `router.spec` | pyinstaller 规格：把 `router.py` 冻成单文件可执行 `router` |
+| `router.spec` | pyinstaller 规格（**onedir**）：把 `router.py` 冻成 `router` + `_internal/` 目录（原因与实测见 §5.7，别改回 onefile） |
 | `models.template.json` | **脱敏**配置模板（所有 `api_key` 已清空），首次启动时拷到 AppSupport |
 | `make_dmg.sh` | 把 `.app` 打成可分发的 DMG：`bash make_dmg.sh --verify` |
 
@@ -237,10 +237,16 @@ Cline 官方 API（`api.cline.bot`）的**非流式**响应是 `{"data": {...cho
 - 开机自启是**两个 LaunchAgent**：路由服务 + 菜单栏 App，由 App 菜单里的「开机自启」一并开关。
 - **拉起路由器的两条路径**：装了开机自启 → `launchctl kickstart`（launchd 有 KeepAlive 托底）；没装 → 直接用 `Process` 拉起 `Contents/MacOS/router --data-dir <AppSupport>`，并把 pid 写进 `router.pid`（停止时按 pid 杀，避免留孤儿进程）。
 
-### 5.7 路由器冻结（pyinstaller）
-- `router.py` 只用标准库（`urllib`/`json`/`http.server`），所以冻结很干净：`router.spec` 里只额外声明 `hiddenimports=["admin_ui"]`，并把常见的第三方大块（numpy/playwright/…）排除掉。
-- 产物是 **onefile**：单文件 3.7M，内嵌 Python 3.9 运行时，目标机不需要装 Python。
-- **启动需要 2~4 秒**（onefile 要先把自己解压到 `/var/folders/...` 再执行）；首次运行新签名的二进制时，macOS 还要做一次代码签名校验，**可能长达 15 秒**。所以双击 App 后菜单栏可能先显示 `⇄ ⏸`，等一会儿会自动变`⇄ 15`——这是正常的，不是没起来。
+### 5.7 路由器冻结（pyinstaller · **onedir**，2026-09-27 起）
+- `router.py` 只用标准库（`urllib`/`json`/`http.server`），所以冻结很干净：`router.spec` 的 `hiddenimports` 只列 6 个本地模块（`admin_ui`/`codebuddy`/`free_quota`/`responses_api`/`volc_fuel`/`workbuddy_credits`），并把常见的第三方大块（numpy/playwright/…）排除掉。
+- 产物是 **onedir**（目录，不是单文件）：`build/pyi/router/router` + `build/pyi/router/_internal/`，约 11M，内嵌 Python 3.9 运行时，目标机不需要装 Python。
+- **为什么不能改回 onefile**（实测数据，别凭直觉改回去）：onefile 每次启动都要把运行时解压到 `/var/folders/.../_MEIxxxx/`，解压出的 `.so` 每次都是新 inode，macOS 的代码签名校验（amfid）没法复用缓存，于是几十个二进制每次启动都要重校验一遍。实测 `router --help` **28.7 秒**（CPU 只花 0.3 秒，几乎全在等）、完整启动到 `/health` **35.2 秒**；同一份代码用系统 `python3 router.py` 只要 **0.43 秒**。换 onedir 后：首次 2.2 秒、**稳态 0.80~0.84 秒**。
+- **`.app` 内的布局必须遵守 PyInstaller 6 在 macOS 的约定**（`bar/build.sh` 已实现）：
+  - `Contents/MacOS/router` —— launcher（plist / Swift 里写死的路径就是它，不用改）
+  - `Contents/Frameworks/*` —— 运行时（即 onedir 里 `_internal` 的内容）
+  - ⚠️ 不能把 `_internal` 放 `Contents/MacOS/` 下：launcher 一旦发现自己在 `*.app/Contents/MacOS/` 里，就会把 `sys._MEIPASS` 定位到 `../Frameworks`，报 `Failed to load Python shared library .../Contents/Frameworks/Python3`（实测踩过）。
+- **签名**：`build.sh` 会逐个给 `Frameworks` 里所有 Mach-O 打 ad-hoc 签名（实测 45 个）。这一步不能省——签名缺失或每次构建都在变，就会退回"每次 dlopen 全量校验"的慢路径。`.app` **外层**签名会因 `Frameworks/python3.9` 这个目录名被 codesign 误判成非法 bundle 而失败（脚本打印 `! .app 外层未签名`），**这是已知且可接受的**：launchd 直接拉起 `Contents/MacOS/` 里的两个二进制，它们各自的签名都有效。
+- 进程数：onefile 是「launcher 父进程 + Python 子进程」共 2 个；onedir 只有 **1 个**（launcher 直接跑 Python）。加上菜单栏 App，整机从 3 个进程降到 **2 个**。
 - 冻结模式下 `sys.stderr` 不一定能传回父进程的管道，所以 `log()` 除了写 stderr，**还会追加一份到 `~/Library/Application Support/ClineRouter/router.log`**，保证任何时候都有日志可看。
 - 架构：默认 `native`（本机 Intel → x86_64）。要出通用包（Intel + Apple Silicon 都能跑）：`BUILD_ARCH=universal bash bar/build.sh`。
 
@@ -484,3 +490,4 @@ bash bar/build.sh install && launchctl kickstart -k gui/$(id -u)/com.wangcheng.c
 | 2026-09-25 | **健壮性打磨**（体检后修复）：`RouterHTTPServer` 重写 `handle_error`（RST/EPIPE 只记一行 `CLIENT-DROP`，消除日志 Traceback 噪音）；启动 bind 撞 `EADDRINUSE` 重试 3 次后清晰退出；自检补 `/api/fuel`、`/api/workbuddy` 用例并用临时 `--data-dir` 隔离缓存 |
 | 2026-09-26 | **菜单栏精简**：删除「模型（N）」子菜单（只用于点按复制模型 ID，与「默认模型」子菜单重复），同步删掉 `copyModelId` 动作；查模型清单改用 `bash cline-router.sh models` |
 | 2026-09-26 | **打通 Cline 产品通道免费模型（`cline-free/*`）**：实测服务端按**请求头**识别「Cline 产品界面」——`upstreams.cline` 补齐 8 个客户端标识头（`X-CLIENT-TYPE`/`X-PLATFORM`/`X-CORE-VERSION`/`X-TASK-ID` 等，提取自扩展 `sep()` 函数）后，`cline-free/deepseek-v4.1-flash` 由 403 变 200 且**余额零变化**（$0.00359 多次调用不变）；新增 `cline-free-deepseek41`（对话模型 29 → 30）。同款模型的既有免费通道：`cb-deepseek-v41-flash`（CodeBuddy 订阅）、`volc-deepseek41`（火山套餐） |
+| 2026-09-27 | **打包形态 onefile → onedir，启动 35 秒 → 0.8 秒**：实测 onefile 每次启动自解压 + macOS 逐个 amfid 校验，`router --help` 要 28.7 秒、到 `/health` 要 35.2 秒（CPU 仅 0.3 秒，全是等待）；改 onedir 后稳态 0.80~0.84 秒、首次 2.2 秒。同步修 `bar/build.sh`：组装布局改为运行时进 `Contents/Frameworks`（遵守 PyInstaller 6 的 macOS `_MEIPASS` 约定），并对 45 个 Mach-O 逐个 ad-hoc 签名；`.app` 外层签名因 `Frameworks/python3.9` 被 codesign 误判为非法 bundle 而跳过（launchd 直接拉起 `Contents/MacOS/` 内二进制，不受影响）。plist 模板去掉 `ProcessType=Background`（避免最低调度优先级 + IO/网络节流），加 `ThrottleInterval=1`、`ExitTimeOut=5`。进程数 3 → 2 |

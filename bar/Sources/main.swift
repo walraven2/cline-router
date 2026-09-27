@@ -387,7 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: dir))
     }
 
-    /// 稍后刷新状态。路由器是 onefile 打包，启动要自解压 2~4 秒，所以支持带重试。
+    /// 稍后刷新状态。路由器是 onedir 打包，约 1 秒内就绪，保留重试是为兜住开机瞬间的忙碌。
     /// autoStartIfDown=true 时：重试都还失败才自己拉起服务（用于 App 启动自愈）——
     /// 先给 launchd 的 router agent 足够时间，避免开机时两个实例抢着启动互相拖死。
     func refreshSoon(_ delay: Double = 1.8, retries: Int = 0, autoStartIfDown: Bool = false) {
@@ -407,7 +407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 等服务就绪：重启/启动后 onefile 要自解压 15~20 秒才监听端口。
+    /// 等服务就绪：重启/启动后路由器约 1 秒即监听端口（onedir，实测冷启动 0.8 秒）。
     /// 期间每 1.5 秒刷一次状态与标题，一亮就把图标切回「● 运行中」——用户不必自己再点一次。
     func waitForRunning(tries: Int = 24, interval: Double = 1.5) {
         func tick(_ left: Int) {

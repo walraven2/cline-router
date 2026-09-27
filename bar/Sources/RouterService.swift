@@ -300,7 +300,7 @@ final class RouterService {
         proc.executableURL = URL(fileURLWithPath: routerBin)
         proc.arguments = ["--data-dir", appSupportDir]
         proc.currentDirectoryURL = URL(fileURLWithPath: appSupportDir)
-        // 路由器是 onefile 打包的：启动时要自解压，2~4 秒后才真正监听端口（菜单会先显示未运行，稍后自动刷新）
+        // 路由器是 onedir 打包的（2026-09-27 起）：不做自解压，约 1 秒内监听端口
         proc.standardOutput = openAppendHandle(logPath)
         proc.standardError = openAppendHandle(logPath)
         do {
@@ -357,6 +357,13 @@ final class RouterService {
 // 每次都整份重写：这样从「源码模式」切到「.app 模式」时，plist 里指向
 // /usr/bin/python3 <旧路径>/router.py 的旧内容会被自动更新到 .app 内的二进制。
 
+/// 两个 LaunchAgent 共用的 plist 模板。
+/// 调参说明（都不是随手写的）：
+///   · 不要加 `ProcessType=Background`：它会把进程降到最低调度优先级并节流
+///     IO/网络，实测拖慢启动；路由器是本地服务，用默认的 Standard 就够。
+///   · `ThrottleInterval` 默认 10 秒（启动失败后的重启节流），收到 1 秒。
+///   · `ExitTimeOut` 默认 20 秒（SIGTERM 后等进程退出），收到 5 秒，
+///     让菜单栏的「停止/重启服务」不用干等。
 func plistTemplate(label: String, program: String, args: [String], workDir: String, log: String) -> String {
     var argLines = "        <string>\(program)</string>\n"
     for a in args {
@@ -378,8 +385,10 @@ func plistTemplate(label: String, program: String, args: [String], workDir: Stri
         <true/>
         <key>KeepAlive</key>
         <true/>
-        <key>ProcessType</key>
-        <string>Background</string>
+        <key>ThrottleInterval</key>
+        <integer>1</integer>
+        <key>ExitTimeOut</key>
+        <integer>5</integer>
         <key>StandardOutPath</key>
         <string>\(log)</string>
         <key>StandardErrorPath</key>

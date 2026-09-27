@@ -79,7 +79,7 @@ Cline 路由 · 安装说明
 六、常见问题
   · 菜单栏图标显示「⇄ ⏸」= 服务没起来。点「启动路由服务」，
     或看 ~/Library/Application Support/ClineRouter/router.log
-  · 服务刚启动要等 2~4 秒（路由器是打包的单文件程序，启动时需自解压）
+  · 服务启动约 1 秒即就绪（onedir 打包，不做自解压）
   · 端口被占：面板里把端口改成别的（默认 4000），保存后重启服务
 TXT
 
@@ -101,6 +101,7 @@ if [ "$DO_VERIFY" = "1" ]; then
   fail=0
   [ -d "$MNT/$APP_NAME.app" ]                                   || { echo "  ✗ 缺少 $APP_NAME.app"; fail=1; }
   [ -x "$MNT/$APP_NAME.app/Contents/MacOS/router" ]             || { echo "  ✗ 缺少路由器二进制"; fail=1; }
+  [ -d "$MNT/$APP_NAME.app/Contents/Frameworks/python3.9" ]      || { echo "  ✗ 缺少运行时 Contents/Frameworks（onedir 没装全）"; fail=1; }
   [ -x "$MNT/$APP_NAME.app/Contents/MacOS/ClineRouterBar" ]     || { echo "  ✗ 缺少菜单栏程序"; fail=1; }
   [ -L "$MNT/Applications" ]                                    || { echo "  ✗ 缺少 Applications 快捷方式"; fail=1; }
   [ -f "$MNT/安装说明.txt" ]                                     || { echo "  ✗ 缺少安装说明"; fail=1; }

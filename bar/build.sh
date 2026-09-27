@@ -43,8 +43,10 @@ if [ -z "$PYI" ]; then
   fi
 fi
 
-# ---------- 1) 冻结 Python 路由器 ----------
-echo "== 冻结路由器（arch=$BUILD_ARCH）=="
+# ---------- 1) 冻结 Python 路由器（onedir）----------
+# 注意：必须是 onedir。onefile 每次启动都要解压内嵌运行时到 /var/folders/，
+# 解压出的 .so 是新 inode，macOS 每次都要重做一遍签名校验 → 启动 28~35 秒（实测）。
+echo "== 冻结路由器（arch=$BUILD_ARCH, onedir）=="
 mkdir -p "$ROOT/build"
 PYI_LOG="$ROOT/build/pyi.log"
 rm -rf "$ROOT/build/pyi"
@@ -54,8 +56,9 @@ if ! (cd "$ROOT" && ROUTER_ARCH="$BUILD_ARCH" "$PYI" router.spec \
   tail -25 "$PYI_LOG"
   exit 1
 fi
-[ -x "$ROOT/build/pyi/router" ] || { echo "冻结未产出 build/pyi/router"; exit 1; }
-echo "  → build/pyi/router  ($(du -h "$ROOT/build/pyi/router" | cut -f1))"
+[ -x "$ROOT/build/pyi/router/router" ] || { echo "冻结未产出 build/pyi/router/router"; exit 1; }
+[ -d "$ROOT/build/pyi/router/_internal" ] || { echo "冻结未产出 build/pyi/router/_internal"; exit 1; }
+echo "  → build/pyi/router/  ($(du -sh "$ROOT/build/pyi/router" | cut -f1))"
 
 # ---------- 2) 编译菜单栏 App ----------
 echo "== 编译 $BIN =="
@@ -78,8 +81,16 @@ else
 fi
 
 # ---------- 3) 组装 .app ----------
-# 路由器二进制进 Contents/MacOS/，菜单栏 App 直接拉它（不再依赖源码目录里的 .sh）
-cp "$ROOT/build/pyi/router" "$APP/Contents/MacOS/router"
+# 布局必须跟随 PyInstaller 6 在 macOS 的约定：
+#   Contents/MacOS/router     ← launcher（plist / Swift 里写死的路径，不变）
+#   Contents/Frameworks/*     ← 运行时（即 onedir 的 _internal 内容）
+# 为什么不能把 _internal 放 Contents/MacOS/ 下：launcher 一旦发现自己在
+# *.app/Contents/MacOS/ 里，就会把 sys._MEIPASS 定位到 ../Frameworks，
+# 实测报 "Failed to load Python shared library .../Contents/Frameworks/Python3"。
+rm -rf "$APP/Contents/Frameworks"
+mkdir -p "$APP/Contents/Frameworks"
+cp -R "$ROOT/build/pyi/router/_internal/." "$APP/Contents/Frameworks/"
+cp "$ROOT/build/pyi/router/router" "$APP/Contents/MacOS/router"
 chmod +x "$APP/Contents/MacOS/router"
 
 # 配置模板：首次启动时 App 拷到 ~/Library/Application Support/ClineRouter/models.json
@@ -127,12 +138,30 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 # ---------- 4) ad-hoc 签名 ----------
-# 先签内层两个可执行，再签整个 .app（--deep 对 ad-hoc 够用；有 Developer ID 时换 --sign "Developer ID Application: ..."）
+# 先签 Frameworks 里所有 Mach-O，再签两层可执行，最后签整个 .app。
+# onedir 里这一步不能省：未签名（或每次构建签名都变）的 Mach-O 会让 macOS
+# 每次 dlopen 都重做完整校验，那正是 onefile 慢的病根；签好并保持文件位置稳定后，
+# 系统才能复用校验缓存 → 启动 <1 秒。
+if [ -d "$APP/Contents/Frameworks" ]; then
+  signed=0
+  while IFS= read -r -d '' f; do
+    if file -b "$f" | grep -q "Mach-O"; then
+      codesign --force --sign - "$f" >/dev/null 2>&1 && signed=$((signed+1))
+    fi
+  done < <(find "$APP/Contents/Frameworks" -type f -print0 2>/dev/null)
+  echo "  已 ad-hoc 签名 Frameworks 内 Mach-O：$signed 个"
+fi
 codesign --force --sign - "$APP/Contents/MacOS/router" >/dev/null 2>&1 || true
 codesign --force --sign - "$APP/Contents/MacOS/$BIN"   >/dev/null 2>&1 || true
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "（跳过 ad-hoc 签名）"
+if codesign --force --sign - "$APP" >/dev/null 2>&1; then
+  echo "  .app 外层签名 OK"
+elif codesign --force --deep --sign - "$APP" >/dev/null 2>&1; then
+  echo "  .app 外层签名 OK（--deep）"
+else
+  echo "  ! .app 外层未签名（内层已逐个签好，不影响 launchd 直接拉起与启动速度）"
+fi
 echo "== 已生成 $APP =="
-echo "   路由器二进制 $(du -h "$APP/Contents/MacOS/router" | cut -f1) / 菜单栏 App $(du -h "$APP/Contents/MacOS/$BIN" | cut -f1)"
+echo "   运行时 Frameworks $(du -sh "$APP/Contents/Frameworks" | cut -f1) / 菜单栏 App $(du -h "$APP/Contents/MacOS/$BIN" | cut -f1)"
 
 case "${1:-build}" in
   run)

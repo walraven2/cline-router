@@ -1,13 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""pyinstaller 规格：把 router.py（含 admin_ui）冻成单文件可执行 `router`。
+"""pyinstaller 规格：把 router.py（含本地模块）冻成「onedir」目录形态。
 
-由 bar/build.sh 调用：
-    pyinstaller router.spec --distpath build/pyi --workpath build/pyi-work --noconfirm
+为什么是 onedir 而不是 onefile（2026-09-27 实测）：
+    onefile 每次启动都要先把内嵌运行时解压到 /var/folders/.../_MEIxxxx/，
+    解压出的 .so / dylib 每次都是全新 inode，macOS 的代码签名校验（amfid）
+    无法复用缓存，于是每次启动都要把几十个二进制重新校验一遍。
+    实测：`router --help` 要 28.7 秒（CPU 仅 0.3 秒，几乎全是等待），
+    完整启动到 /health 可响应要 35 秒；同一份代码用系统 python3 跑只要 0.43 秒。
+    onedir 不做解压、文件位置固定，校验结果可被系统缓存 → 启动 <1 秒。
+
+产物：build/pyi/router/            ← 目录（launcher 可执行）
+      build/pyi/router/_internal/  ← 全部运行时依赖
+由 bar/build.sh 整体铺进 Cline 路由.app/Contents/MacOS/。
 
 环境变量：
     ROUTER_ARCH = native（默认）| universal2 | x86_64 | arm64
-
-产物：build/pyi/router —— 直接嵌进 Cline 路由.app/Contents/MacOS/router。
 """
 import os
 
@@ -37,19 +44,26 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,             # onedir：二进制不打进 launcher，交给 COLLECT
     name="router",
     debug=False,
     bootloader_ignore_signals=False,   # 让 launchd 的 SIGTERM 能正常传到 Python
     strip=False,
     upx=False,
-    runtime_tmpdir=None,               # onefile：解压到系统临时目录再跑
     console=True,                      # 保留 stdout/stderr（launchd 重定向到日志用）
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=target_arch,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="router",
 )
