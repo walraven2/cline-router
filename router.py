@@ -443,6 +443,13 @@ def build_opener(up):
     )
 
 
+# 「我们自己发起、与上游配置无关」的请求（如下载生成的图片）：显式直连。
+# 不用裸 urlopen：它的默认 opener 是进程级的，ProxyHandler 只在第一次请求时读一次
+# getproxies() 并缓存到进程结束 —— 那一刻若 Clash 开着并设了系统代理，之后关掉 Clash
+# 就会一直 [Errno 61] Connection refused，改系统设置也不会自愈（2026-09-27 实测）。
+DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def upstream_call(up, payload, timeout=None, path=None):
     """向上游发一次普通（非流式）请求，返回 (status, text)。path 缺省用上游的对话路径。"""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -776,7 +783,7 @@ class Router(BaseHTTPRequestHandler):
         try:
             os.makedirs(IMAGES_DIR, exist_ok=True)
             req = urllib.request.Request(url, headers={"User-Agent": "cline-router/1.0"})
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            with DIRECT_OPENER.open(req, timeout=180) as resp:
                 head = resp.read(16)
                 ext = "png"
                 if head.startswith(b"\xff\xd8\xff"):

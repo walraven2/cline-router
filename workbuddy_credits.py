@@ -171,6 +171,7 @@ class Settings(object):
         self.endpoint = DEFAULT_ENDPOINT
         self.access_token = ""
         self.user_id = ""
+        self.proxy = ""
 
 
 def load_settings():
@@ -184,6 +185,8 @@ def load_settings():
             s.access_token = str(root["accessToken"]).strip()
         if root.get("userId"):
             s.user_id = str(root["userId"]).strip()
+        if root.get("proxy"):
+            s.proxy = str(root["proxy"]).strip()
     except (OSError, ValueError):
         pass
     if os.environ.get("WORKBUDDY_ENDPOINT"):
@@ -192,6 +195,8 @@ def load_settings():
         s.access_token = os.environ["WORKBUDDY_ACCESS_TOKEN"].strip()
     if os.environ.get("WORKBUDDY_USER_ID"):
         s.user_id = os.environ["WORKBUDDY_USER_ID"].strip()
+    if os.environ.get("WORKBUDDY_PROXY"):
+        s.proxy = os.environ["WORKBUDDY_PROXY"].strip()
     return s
 
 
@@ -404,6 +409,27 @@ class AuthError(RuntimeError):
     """令牌不可用（HTTP 401/403 或业务码 401/40301）——可以换下一个候选。"""
 
 
+_OPENERS = {}
+
+
+def http_opener(proxy=""):
+    """按代理配置取 opener；proxy 为空＝显式直连。
+
+    为什么不用裸 urlopen：它的默认 opener 是进程级的，ProxyHandler 只在第一次请求时
+    读一次 getproxies() 并缓存到进程结束 —— 那一刻若 Clash 开着并设了系统代理，
+    之后关掉 Clash 就会一直 [Errno 61] Connection refused，改系统设置也不会自愈
+    （2026-09-27 实测：关 Clash X 后积分/燃料连续报错约 4 分钟）。
+    copilot.tencent.com 是境内端点，默认直连；确需走代理用 WORKBUDDY_PROXY / config.json 的 proxy。
+    """
+    proxy = (proxy or "").strip()
+    opener = _OPENERS.get(proxy)
+    if opener is None:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
+        _OPENERS[proxy] = opener
+    return opener
+
+
 def api_post(settings, path, token, uid, timeout=20):
     url = settings.endpoint.rstrip("/") + path
     req = urllib.request.Request(url, data=b"{}", method="POST")
@@ -415,7 +441,7 @@ def api_post(settings, path, token, uid, timeout=20):
     if uid:
         req.add_header("X-User-Id", uid)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with http_opener(settings.proxy).open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         body = ""
@@ -456,7 +482,7 @@ def _post_checkin(settings, token, uid, timeout=20):
     if uid:
         req.add_header("X-User-Id", uid)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with http_opener(settings.proxy).open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
             status = resp.getcode()
     except urllib.error.HTTPError as exc:

@@ -109,11 +109,46 @@ def _hint(raw):
     return ""
 
 
+_PROXY_CACHE = None
+_OPENERS = {}
+
+
+def _proxy():
+    """显式代理（默认空 = 直连），可用 VOLC_PROXY 或 volc-fuel.json 的 proxy 覆盖。
+
+    为什么不用裸 urlopen：它的默认 opener 是进程级的，ProxyHandler 只在第一次请求时
+    读一次 getproxies() 并缓存到进程结束 —— 那一刻若 Clash 开着并设了系统代理，
+    之后关掉 Clash 就会一直 [Errno 61] Connection refused，改系统设置也不会自愈
+    （2026-09-27 实测：关 Clash X 后燃料/积分连续报错约 4 分钟）。火山是境内端点，直连即可。
+    """
+    global _PROXY_CACHE
+    if _PROXY_CACHE is None:
+        proxy = (os.environ.get("VOLC_PROXY") or "").strip()
+        if not proxy:
+            try:
+                with open(CONFIG_FILE, encoding="utf-8") as fh:
+                    proxy = str((json.load(fh) or {}).get("proxy") or "").strip()
+            except (OSError, ValueError):
+                proxy = ""
+        _PROXY_CACHE = proxy
+    return _PROXY_CACHE
+
+
+def _opener():
+    proxy = _proxy()
+    opener = _OPENERS.get(proxy)
+    if opener is None:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
+        _OPENERS[proxy] = opener
+    return opener
+
+
 def call_api(ak, sk, action=ACTION, timeout=15):
     url, headers, payload = sign_request(ak, sk, action=action)
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener().open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace")

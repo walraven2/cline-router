@@ -43,6 +43,10 @@ _UP_SEM = threading.Semaphore(MAX_CONCURRENCY)
 # 重试一次。设为 0 可关闭自愈（退回原来的直接报错）。
 EMPTY_MIN_TOKENS = int(os.environ.get("BRIDGE_EMPTY_MIN_TOKENS", "1024"))
 
+# 上游是本机路由（127.0.0.1），必须直连：裸 urlopen 的默认 opener 会缓存「第一次请求时」
+# 读到的系统代理，Clash 一开一关就可能把本机请求也塞进代理 → Connection refused。
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 FINISH_MAP = {
     "stop": "end_turn",
     "length": "max_tokens",
@@ -498,7 +502,7 @@ class Handler(BaseHTTPRequestHandler):
                     log("上游重试 %d/%d，退避 %ds" % (attempt + 1, max_retries, backoff))
                     time.sleep(backoff)
                 try:
-                    return urllib.request.urlopen(
+                    return _LOCAL_OPENER.open(
                         self._upstream_req(payload, stream), timeout=UPSTREAM_TIMEOUT), None
                 except urllib.error.HTTPError as exc:
                     detail = exc.read()
